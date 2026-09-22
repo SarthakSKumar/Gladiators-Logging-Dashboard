@@ -88,7 +88,9 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     db: msgDb, log,
     onClosed: g => {
       pushStatus()
-      if (g.status === 'unverified' && !['idle', 'not_linked', 'linking'].includes(g.cause)) {
+      // only gaps that overlapped a logging session matter to an operator (idle/server-off time does not)
+      const overlapped = msgDb.prepare('SELECT count(*) FROM sessions WHERE started_at < ? AND coalesce(ended_at, ?) > ?').pluck().get(g.ended_at, g.ended_at, g.started_at)
+      if (g.status === 'unverified' && overlapped && !['idle', 'not_linked', 'linking'].includes(g.cause)) {
         const detail = `Capture was not running from ${new Date(g.started_at).toISOString()} to ${new Date(g.ended_at).toISOString()} (${g.cause}) while a group was logging. WhatsApp gives no way to prove nothing was missed.`
         ops.emit({ level: 'warn', code: 'capture.gap_unverified', message: 'A capture gap could not be verified', context: { gapId: g.id, cause: g.cause, from: g.started_at, to: g.ended_at } })
         alerts.notify({ title: 'Capture gap could not be verified', channels: ['email', 'whatsapp'], detail })
