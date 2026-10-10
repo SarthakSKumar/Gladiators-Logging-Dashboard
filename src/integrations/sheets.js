@@ -25,9 +25,15 @@ const backoffMs = attempts => Math.min(60 * 60_000, 5_000 * 2 ** Math.max(0, att
 
 /** config/sheets.json: { "targets": [{ "key", "groupJid", "groupName", "url" }] } (missing file = disabled) */
 export const loadSheetsConfig = configDir => {
+  // SHEETS_JSON (environment) wins over the file: the script URLs are as good as a password, so a host can keep
+  // them out of git. Same JSON as config/sheets.json.
   const file = join(configDir, 'sheets.json')
-  if (!existsSync(file)) return []
-  const { targets = [] } = JSON.parse(readFileSync(file, 'utf8'))
+  if (!process.env.SHEETS_JSON && !existsSync(file)) return []
+  let parsed
+  try { parsed = JSON.parse(process.env.SHEETS_JSON || readFileSync(file, 'utf8')) } catch (err) {
+    throw new Error(`${process.env.SHEETS_JSON ? 'SHEETS_JSON' : 'config/sheets.json'} is not valid JSON: ${err.message}`)
+  }
+  const { targets = [] } = parsed
   for (const t of targets) {
     if (!t.key || !t.groupJid?.endsWith('@g.us') || !t.groupName || !/^https:\/\//.test(t.url || '')) {
       throw new Error(`config/sheets.json: each target needs key, groupJid (…@g.us), groupName and an https url (${t.key || '?'})`)

@@ -55,8 +55,18 @@ const readJson = (file, fallback) => {
   }
 }
 
-/** [{ name, email, phone, alerts }] — login allow-list and alert recipients */
-export const loadAdmins = () => readJson('admins.json', []).map(a => ({
+/**
+ * [{ name, email, phone, alerts }] — login allow-list and alert recipients.
+ * Source: the ADMINS_JSON environment variable if set (same JSON as the file; lets a host like Render keep
+ * emails/phones out of git), otherwise config/admins.json.
+ */
+const adminList = () => {
+  if (env.ADMINS_JSON) {
+    try { return JSON.parse(env.ADMINS_JSON) } catch (err) { throw new Error(`ADMINS_JSON is not valid JSON: ${err.message}`) }
+  }
+  return readJson('admins.json', [])
+}
+export const loadAdmins = () => adminList().map(a => ({
   name: a.name,
   email: String(a.email || '').trim().toLowerCase(),
   phone: String(a.phone || '').replace(/[^\d]/g, ''),
