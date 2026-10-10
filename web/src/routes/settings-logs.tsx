@@ -115,6 +115,9 @@ const GAP_CAUSE: Record<string, string> = {
   logged_out: "Logged out",
   unlinked: "Unlinked",
   restore: "Restored from backup",
+  stopped: "Server stopped",
+  needs_link: "Not linked",
+  link_idle: "Not linked",
   auth_rollback: "Auth rollback",
 }
 

@@ -20,10 +20,18 @@ let app = null
 
 const factory = opts => {
   const sock = f.factory(opts)
-  const groups = app?.msgDb?.prepare('SELECT jid, subject_current AS subject FROM groups WHERE jid IS NOT NULL').all() ?? []
-  sock.groups = Object.fromEntries(groups.map((g, i) => [g.jid, { id: g.jid, subject: g.subject, size: 40 + i * 17 }]))
+  // the account's group list = the copy's known groups, read when asked (app may not exist yet at first connect)
+  sock.groupFetchAllParticipating = async () => {
+    const groups = app.msgDb.prepare("SELECT jid, coalesce(subject_current, label) AS subject FROM groups WHERE jid IS NOT NULL UNION SELECT jid, subject FROM account_groups").all()
+    return Object.fromEntries(groups.map((g, i) => [g.jid, { id: g.jid, subject: g.subject, size: 40 + i * 17 }]))
+  }
   setTimeout(async () => {
-    if (!opts.auth.creds.me) { await sock.emit({ 'connection.update': { qr: `2@harness-${Date.now()}` } }); return }
+    if (!opts.auth.creds.me) {
+      await sock.emit({ 'connection.update': { qr: `2@harness-${Date.now()}` } })
+      // like WhatsApp: the QR expires if nobody scans it (shortened for QA)
+      setTimeout(() => sock.close(408, 'QR refs attempts ended'), Number(process.env.HARNESS_QR_MS || 8000))
+      return
+    }
     await sock.emit({ 'connection.update': { connection: 'open' } })
     await sock.emit({ 'connection.update': { receivedPendingNotifications: true } })
   }, 600)
@@ -50,7 +58,10 @@ app = await startApp({
   config: { ...config, dataDir: join(dir, 'data'), backupDir: join(dir, 'backups'), port: Number(port), devOtpToConsole: true },
   log, makeSocket: factory, getVersion: async () => undefined, mailer: { configured: false, send: async () => {} }
 })
-if (mode !== 'unlinked') {
+if (mode === 'unlinked') {
+  app.authStore.wipe()
+  await app.capture.reconcile()
+} else {
   app.authStore.creds.me = { id: '919742913699:7@s.whatsapp.net', name: 'Gladiators Logger' }
   await app.authStore.saveCreds()
   app.capture.lease('harness', 15_000)

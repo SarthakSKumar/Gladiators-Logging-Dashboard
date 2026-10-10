@@ -7,7 +7,7 @@ import { HistorySheet } from "@/components/history-sheet"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { ago, full, greeting, num } from "@/lib/format"
+import { ago, full, greeting, num, when } from "@/lib/format"
 import { useKpis, useMe, useStatus } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 
@@ -39,21 +39,21 @@ function KpiStrip() {
   const d = k.data
   return (
     <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border bg-border sm:grid-cols-3 xl:grid-cols-6 [&>div]:bg-background">
-      <Kpi label="Bet messages logged" value={num(d.messagesAllTime)} hint="All time, selected groups" />
+      <Kpi label="Bet messages logged" value={num(d.messagesAllTime)} hint="All time" />
       <Kpi label="Messages today" value={num(d.messagesToday)} hint={`${num(d.sessionsToday)} session${d.sessionsToday === 1 ? "" : "s"} today`} />
-      <Kpi label="Last message" value={d.lastMessageAt ? ago(d.lastMessageAt) : "—"} hint={d.lastMessageAt ? full(d.lastMessageAt) : "Nothing logged yet"} title={full(d.lastMessageAt)} />
-      <Kpi label="Groups configured" value={num(d.groupsConfigured)} hint={<Link className="hover:text-foreground hover:underline" to="/settings/groups">Manage groups</Link>} />
-      <Kpi label="Logging now" value={num(d.groupsLogging)} hint={d.groupsLogging ? "Capture runs while any group logs" : "No group is logging"} />
+      <Kpi label="Last message" value={d.lastMessageAt ? ago(d.lastMessageAt) : "—"} hint={d.lastMessageAt ? when(d.lastMessageAt) : "Nothing logged yet"} title={full(d.lastMessageAt)} />
       <Kpi
-        label="Ingestion issues today"
-        value={num(d.ingestionFailuresToday)}
-        tone={d.ingestionFailuresToday ? "warn" : undefined}
-        hint={
-          <Link className="hover:text-foreground hover:underline" to="/settings/logs">
-            {d.gapsToday ? `${d.gapsToday} capture gap${d.gapsToday === 1 ? "" : "s"} · ` : ""}View logs
-          </Link>
+        label="Logging now"
+        value={
+          <>
+            {num(d.groupsLogging)}
+            <span className="text-sm font-normal text-muted-foreground"> / {num(d.groupsConfigured)}</span>
+          </>
         }
+        hint={<Link className="hover:text-foreground hover:underline" to="/settings/groups">of {d.groupsConfigured} configured groups</Link>}
       />
+      <Kpi label="Ingestion issues today" value={num(d.ingestionFailuresToday)} tone={d.ingestionFailuresToday ? "warn" : undefined} hint={<Link className="hover:text-foreground hover:underline" to="/settings/logs">View logs</Link>} />
+      <Kpi label="Capture gaps today" value={num(d.gapsToday)} tone={d.gapsToday ? "warn" : undefined} hint="During logging" />
     </dl>
   )
 }

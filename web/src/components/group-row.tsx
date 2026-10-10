@@ -64,11 +64,11 @@ export function GroupRow({ group, capture, onHistory }: { group: SelectedGroup; 
       <span title={dotLabel} className="flex items-center" role="img" aria-label={dotLabel}>
         <Dot tone={tone} ping={tone === "live"} />
       </span>
-      <div className="flex min-w-0 flex-1 items-center gap-3">
-        <span className="min-w-0 max-w-[45%] shrink-0 truncate font-medium" title={group.label}>
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-3">
+        <span className="min-w-0 truncate font-medium sm:max-w-[45%] sm:shrink-0" title={group.label}>
           {group.label}
         </span>
-        <Separator orientation="vertical" className="data-[orientation=vertical]:h-4" />
+        <Separator orientation="vertical" className="hidden data-[orientation=vertical]:h-4 sm:block" />
         <span className="min-w-0 truncate text-sm text-muted-foreground tabular-nums">
           {s ? (
             <>

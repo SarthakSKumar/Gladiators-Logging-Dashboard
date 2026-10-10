@@ -63,7 +63,7 @@ export function WhatsAppSettings() {
           <Row label="Connection">
             <span>{PHASE[c.phase] ?? c.phase}</span>
             <span className="text-muted-foreground"> · since {ago(c.since)}</span>
-            {c.detail && <p className="mt-0.5 text-xs text-muted-foreground">{c.detail}</p>}
+            {c.detail && !["Online", "Disconnected"].includes(c.detail) && <p className="mt-0.5 text-xs text-muted-foreground">{c.detail}</p>}
             {c.nextRetryAt && c.nextRetryAt > Date.now() && <p className="mt-0.5 text-xs text-muted-foreground">Next attempt at {full(c.nextRetryAt)}</p>}
           </Row>
           <Row label="Groups logging">

@@ -24,7 +24,7 @@ export const notifySuccess = (message: string, description?: string) => {
 export const notifyOpEvent = (e: OpEvent) => {
   if (e.noise) return
   if (!shouldShow(`ev|${e.id}`) || !shouldShow(`evmsg|${e.code}|${e.message}`)) return
-  const opts = { description: e.count > 1 ? `Repeated ${e.count}×` : undefined }
+  const opts = { description: e.count > 1 && e.level !== "info" ? `Repeated ${e.count}× in the last minute` : undefined }
   if (e.level === "error") toast.error(e.message, opts)
   else if (e.level === "warn") toast.warning(e.message, opts)
   else if (e.code === "capture.started" || e.code === "wa.linked") toast.success(e.message, opts)

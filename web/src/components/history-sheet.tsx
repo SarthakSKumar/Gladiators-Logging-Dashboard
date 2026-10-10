@@ -31,7 +31,7 @@ function SessionSummary({ s }: { s: Session }) {
   )
 }
 
-function MessagesTable({ sessionId }: { sessionId: number }) {
+function MessagesTable({ sessionId, running }: { sessionId: number; running: boolean }) {
   const q = useMessages(sessionId)
   if (q.isPending)
     return (
@@ -50,7 +50,8 @@ function MessagesTable({ sessionId }: { sessionId: number }) {
         </Button>
       </div>
     )
-  if (!q.data.rows.length) return <p className="py-12 text-center text-sm text-muted-foreground">No messages in this session yet.</p>
+  if (!q.data.rows.length)
+    return <p className="py-12 text-center text-sm text-muted-foreground">{running ? "No messages in this session yet." : "No messages were logged in this session."}</p>
   return (
     <div className="rounded-lg border">
       <Table className="text-[13px]">
@@ -149,7 +150,7 @@ export function HistorySheet({ group, open, onOpenChange }: { group: SelectedGro
                 </SelectContent>
               </Select>
               {current && <SessionSummary s={current} />}
-              {current && <MessagesTable sessionId={current.id} />}
+              {current && <MessagesTable sessionId={current.id} running={!current.ended_at} />}
             </>
           )}
         </div>
