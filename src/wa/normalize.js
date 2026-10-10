@@ -3,7 +3,9 @@
 //                                   ephemeral / view-once / edited wrappers) — the only thing stored
 //   { kind: 'undecryptable', ... }  WhatsApp could not decrypt it: not stored, but reported (never silent)
 //   { kind: 'ignored' }             everything else: media (even with captions), stickers, documents,
-//                                   audio, contacts, locations, polls, reactions, protocol/system messages
+//                                   audio, contacts, locations, polls, reactions, protocol/system messages,
+//                                   and text longer than MAX_LINES lines (balance sheets, bank details, essays:
+//                                   not bets — never stored, parsed, shown or forwarded)
 import { getContentType, isPnUser, normalizeMessageContent, proto, toNumber } from 'baileys'
 
 export const PARSE_VERSION = 2
@@ -11,6 +13,11 @@ export const PARSE_VERSION = 2
 const CIPHERTEXT = proto.WebMessageInfo.StubType.CIPHERTEXT
 const TEXT_TYPES = new Set(['conversation', 'extendedTextMessage'])
 const IGNORED = Object.freeze({ kind: 'ignored' })
+
+/** Bet messages are short. Text with more lines than this is ignored completely. */
+export const MAX_LINES = 3
+/** Lines as the sender sees them: surrounding blank space is not counted, blank lines in between are. */
+export const lineCount = text => text.trim().split(/\r?\n/).length
 
 const isLong = v => v && typeof v === 'object' && typeof v.low === 'number' && typeof v.high === 'number'
 
@@ -32,7 +39,8 @@ export const plainText = content => {
   const type = getContentType(content)
   if (!TEXT_TYPES.has(type)) return null
   const text = type === 'conversation' ? content.conversation : content.extendedTextMessage?.text
-  return typeof text === 'string' && text.length ? text : null
+  if (typeof text !== 'string' || !text.trim()) return null
+  return lineCount(text) > MAX_LINES ? null : text
 }
 
 /**

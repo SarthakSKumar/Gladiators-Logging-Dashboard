@@ -89,3 +89,24 @@ test("undecryptable messages are reported (not silently dropped), never stored a
 test("a message without key/id is structurally invalid", () => {
   assert.throws(() => normalize({ key: {} }, "live"));
 });
+
+test("text of more than 3 lines is ignored entirely (balance sheets, bank details, essays) — 3 lines are fine", () => {
+  const keep = (text) => normalize(msg({ message: { conversation: text } }), "live");
+  assert.equal(keep("1w 1000\n2w 1000\n3w 1000").kind, "message", "exactly 3 lines is kept");
+  assert.equal(keep("1w 1000\n2w 1000\n3w 1000\n4w 1000").kind, "ignored", "4 lines is ignored");
+  assert.equal(keep("a\r\nb\r\nc\r\nd").kind, "ignored", "Windows line breaks count too");
+  assert.equal(keep("1w100\n\n\n2w100").kind, "ignored", "blank lines in between count as lines");
+  assert.equal(keep("\n\n1w100\n\n").kind, "message", "blank space around the text is not counted");
+  assert.equal(keep("   \n  ").kind, "ignored", "whitespace-only is ignored");
+  const bank = "Name - Mariena Shaji\nAccount Number 923010027645375\nIFSC \nUtib0000123";
+  assert.equal(keep(bank).kind, "ignored");
+  // same rule for extendedTextMessage (replies, links) and for text wrapped in ephemeral / view-once
+  const long = "1\n2\n3\n4";
+  assert.equal(normalize(msg({ message: { extendedTextMessage: { text: long } } }), "live").kind, "ignored");
+  assert.equal(normalize(msg({ message: { ephemeralMessage: { message: { conversation: long } } } }), "live").kind, "ignored");
+  // a short reply that QUOTES a long message is still a normal message (the long quote is just not kept)
+  const reply = normalize(msg({ message: { extendedTextMessage: { text: "1w100", contextInfo: { stanzaId: "Q1", quotedMessage: { conversation: long } } } } }), "live");
+  assert.equal(reply.kind, "message");
+  assert.equal(reply.body, "1w100");
+  assert.equal(reply.quoted_body, null);
+});

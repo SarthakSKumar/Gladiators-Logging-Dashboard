@@ -283,3 +283,22 @@ test("only messages sent inside a logging session window are stored (no idle bac
   assert.ok(p.check().ok, JSON.stringify(p.check()));
   p.close();
 });
+
+test("long (>3 line) messages never reach storage, the live stream, or Google Sheets — counted as silently ignored", async () => {
+  const p = makePipeline();
+  p.intake.enqueue(
+    upsert([
+      msg({ id: "SHORT", text: "1w100" }),
+      msg({ id: "THREE", text: "1w100\n2w100\n3w100" }),
+      msg({ id: "LONG", text: "Name: X\nAcc: 123\nIFSC: ABC\nGpay: 99999" }),
+      msg({ id: "SHEET", text: "*BALANCE SHEET*\n\nA 100\nB 200\nC 300" }),
+    ]),
+  );
+  await p.intake.idle();
+  p.committer.tick();
+  assert.deepEqual(p.db.prepare("SELECT wa_msg_id FROM messages ORDER BY wa_msg_id").pluck().all(), ["SHORT", "THREE"]);
+  assert.equal(p.counters.c.excluded_type, 2);
+  assert.equal(p.counters.c.failed_not_durable, 0);
+  assert.ok(p.check().ok, JSON.stringify(p.check()));
+  p.close();
+});

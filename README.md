@@ -34,7 +34,9 @@ one group is logging (has an open session) and stops when none is.
   delivers on reconnect from idle time.
 - Only plain text is stored (`conversation` / `extendedTextMessage`, after unwrapping ephemeral/view-once). Media (even
   with captions), stickers, documents, audio, contacts, locations, polls, reactions, edits/deletes and system messages
-  are ignored by design. Undecryptable messages are reported as operator events, never silently dropped.
+  are ignored by design, and so is any text of **more than 3 lines** (balance sheets, bank details, long posts):
+  it is never stored, shown, parsed or forwarded (`MAX_LINES` in `src/wa/normalize.js`). Undecryptable messages are
+  reported as operator events, never silently dropped.
 - Operator events (`ops_events`): every error/warning that matters is stored with level, code, message and context,
   pushed live (SSE `opevent`), toasted in the dashboard and listed under *Settings → Logs*. Expected noise (e.g. the
   515 restart after pairing) is marked as such and never toasted.
