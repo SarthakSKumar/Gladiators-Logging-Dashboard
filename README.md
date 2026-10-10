@@ -29,6 +29,9 @@ one group is logging (has an open session) and stops when none is.
 - Every period capture is not running is a **capture gap**, closed as `recovered` (WhatsApp delivered a backlog) or
   `unverified`. Only gaps that *begin while a session is logging* (a dropped connection, a server crash) are reported as
   interruptions; idle time between sessions is expected. A gap label never proves completeness.
+- Only messages **sent during a logging session** of their group are stored (whole-second window from Start to
+  Stop). Anything sent before Start, after Stop, or while no group was logging is dropped — including what WhatsApp
+  delivers on reconnect from idle time.
 - Only plain text is stored (`conversation` / `extendedTextMessage`, after unwrapping ephemeral/view-once). Media (even
   with captions), stickers, documents, audio, contacts, locations, polls, reactions, edits/deletes and system messages
   are ignored by design. Undecryptable messages are reported as operator events, never silently dropped.
@@ -106,11 +109,31 @@ Firewall: allow 80/443 (and 22 from your IP only). Node listens on 127.0.0.1:300
 (`timedatectl` / chrony) — session boundaries use the server clock. Snapshot the **whole data volume** (provider
 snapshots or LVM) — never `messages.db` / `auth.db` separately.
 
+## Google Sheets forwarding (Gladiators groups)
+
+A separate, custom integration (`src/integrations/sheets.js`, config in git-ignored `config/sheets.json`, see
+`config/sheets.example.json`). Every message logged in a configured group is POSTed to that group's Apps Script
+endpoint in the same format the Android app used:
+
+```json
+{ "id": 1, "sender": "Ravi", "message": "5 w 100", "groupName": "Gladiators Indian Racing 🏇", "timestamp": 1790000110000, "raceNumber": "3" }
+```
+
+- `raceNumber` is the session's race number and selects the sheet `RACE <n>` — it is required when starting logging
+  in these groups. `id` is 1, 2, 3… per session in arrival order; the script writes it to row `id + 2`, so a retry
+  rewrites the same row (no duplicates). `timestamp` is when the message was sent; `sender` is the WhatsApp name.
+- `groupName` is the exact string the Apps Script routes on (not the WhatsApp subject, which differs by an emoji
+  modifier). Both groups currently use the same deployment URL; the script picks the spreadsheet from `groupName`.
+- Delivery is durable (outbox table `sheet_outbox`): retried with backoff, resumed after restarts, failures shown in
+  *Settings → Logs → Google Sheets* (with *Retry failed*) and as toasts. Messages logged before the integration was
+  enabled are not back-filled.
+
 ## API (changed in v2.1)
 
 Added: `POST /api/wa/link` (start linking / regenerate QR), `GET /api/wa/groups`, `POST /api/wa/groups/refresh`,
 `GET /api/groups`, `POST /api/groups {jid}`, `DELETE /api/groups/:id`, `GET /api/kpis`, `GET /api/events`,
-`GET /api/health` (public liveness), SSE events `opevent` and `ping`. `POST /api/sessions` and
+`GET /api/health` (public liveness), `GET /api/integrations/sheets`, `POST /api/integrations/sheets/retry`,
+SSE events `opevent` and `ping`. `POST /api/sessions` and
 `POST /api/sessions/:id/stop` are idempotent. Removed: `/api/wa/resume`, `/api/wa/show-qr`, `/api/groups/recheck`,
 `/api/groups/:key/pick`, `/api/config/reload`, `/api/backup`.
 

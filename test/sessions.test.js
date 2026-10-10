@@ -10,7 +10,7 @@ test('delayed messages across start/stop boundaries', async () => {
   let clock = 1_790_000_100_400 // Start clicked at …100.4 s
   const sessions = createSessions({ db: p.db, now: () => clock })
   const gid = p.groups.targetOf(G1).id
-  const s = sessions.start({ groupId: gid, label: 'Race 3', raceNumber: 3, by: 't' })
+  const s = sessions.start({ groupId: gid, label: 'RACE 3', raceNumber: 3, by: 't' })
   assert.equal(sessions.start({ groupId: gid, label: 'dup' }).id, s.id, 'repeated start is idempotent')
   clock = 1_790_000_200_700 // Stop clicked at …200.7 s
   sessions.stop({ id: s.id, by: 't' })

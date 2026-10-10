@@ -22,6 +22,7 @@ import { createMailer } from './mailer.js'
 import { createAlerts } from './alerts.js'
 import { classifyBaileysLog, createOpsEvents } from './events.js'
 import { runBackup } from './backup.js'
+import { createSheetsForwarder, loadSheetsConfig } from './integrations/sheets.js'
 import { createWebAuth } from './web/auth.js'
 import { createWebServer } from './web/server.js'
 
@@ -99,9 +100,18 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     }
   })
 
+  // custom integration: Google Sheets forwarding for the two Gladiators groups (config/sheets.json)
+  let sheets
+  try {
+    sheets = createSheetsForwarder({ db: msgDb, targets: loadSheetsConfig(config.configDir), ops, log, fetchImpl: config.sheetsFetch })
+  } catch (err) {
+    ops.emit({ level: 'error', code: 'sheets.config', message: `Google Sheets forwarding is disabled: ${err.message}` })
+    sheets = createSheetsForwarder({ db: msgDb, targets: [], ops, log })
+  }
+
   const committer = createCommitter({
     db: msgDb, journal, groups, counters, log,
-    onCommitted: () => bus.emit('committed'),
+    onCommitted: () => { bus.emit('committed'); sheets.tick() },
     onHealth: (ok, err) => {
       if (ok) {
         alerts.clear('commit')
@@ -155,8 +165,17 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     }
   }
 
+  // only messages sent inside a logging session window of their group are stored (whole-second boundaries,
+  // same rule as session membership); everything else — including WhatsApp's backlog from idle time — is dropped
+  const sessionAt = msgDb.prepare(`SELECT 1 FROM sessions WHERE group_id = ? AND (started_at / 1000) * 1000 <= ?
+    AND (ended_at IS NULL OR ? < (ended_at / 1000) * 1000) LIMIT 1`).pluck()
+  const inSession = (chatJid, ts) => {
+    const g = groups.targetOf(chatJid)
+    return Boolean(g && sessionAt.get(g.id, ts, ts))
+  }
+
   const intake = createIntake({
-    journal, groups, counters, limits: config.limits, log,
+    journal, groups, counters, limits: config.limits, log, inSession,
     onDurable: () => committer.tick(),
     onPressure: (on, reason, detail) => capture?.setPressure(reason, on, detail),
     onMetadata,
@@ -277,7 +296,8 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
       capture: { ...cs, qr: cs.state === 'linking' ? s.qr : null, qrExpired: Boolean(s.qrExpired) },
       groups: groups.list().map(g => ({
         id: g.id, jid: g.jid, label: g.subject_current || g.label, status: g.status, action: g.action,
-        lastMessageAt: g.last_message_at, session: active[g.id] || null, count: textCount.get(g.id)
+        lastMessageAt: g.last_message_at, session: active[g.id] || null, count: textCount.get(g.id),
+        sheets: g.jid && sheets.targetFor(g.jid) ? { groupName: sheets.targetFor(g.jid).groupName } : null
       })),
       gapOpen: gaps.current() || null,
       health: { pendingApply: h.pendingApply, committerDegraded: h.committerDegraded, pressure: h.pressure, invariantsOk: h.invariants.ok }
@@ -344,6 +364,10 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
           const g = groups.get(args.groupId)
           if (!g?.enabled) throw httpError(404, 'Unknown group')
           if (!g.jid || g.status !== 'resolved') throw httpError(409, g.action || 'This group is not available in the linked account')
+          const hasRace = args.raceNumber !== undefined && args.raceNumber !== null && args.raceNumber !== ''
+          if (sheets.targetFor(g.jid) && !hasRace && !sessions.active().some(x => x.group_id === g.id)) {
+            throw httpError(400, 'Choose a race number: this group sends its messages to Google Sheets, and the race number picks the RACE sheet.')
+          }
           const s = sessions.start(args)
           ops.emit({ level: 'info', code: 'session.started', message: `Logging started for "${g.subject_current || g.label}"`, context: { group: g.id, session: s.id }, noise: true })
           return s
@@ -363,6 +387,10 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
         const g = groups.remove(id)
         capture.reconcile(); pushStatus()
         return g
+      },
+      sheets: {
+        status: () => ({ enabled: sheets.enabled, targets: sheets.stats(), failures: sheets.recentFailures() }),
+        retry: target => { const n = sheets.retryFailed(target); sheets.pump(); return { requeued: n } }
       },
       link: async () => {
         if (connection.state().blocked?.reason === 'operator') throw httpError(409, connection.state().blocked.detail)
@@ -425,6 +453,7 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     }
     pushStatus()
   })
+  every(5_000, () => sheets.tick()) // retries with backoff + anything committed while a send was in flight
   every(60_000, () => {
     committer.promotePending({ allResolved: groups.allResolved(), ttlMs: config.pendingScopeTtlMs })
     auth.purgeExpired()
@@ -464,5 +493,5 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     authDb.close()
   }
 
-  return { config, msgDb, authDb, journal, counters, intake, committer, groups, sessions, gaps, connection, capture, alerts, ops, web, bus, authStore, getStatus, getKpis, getDiagnostics, shutdown, backup }
+  return { config, msgDb, authDb, journal, counters, intake, committer, groups, sessions, gaps, connection, capture, alerts, ops, web, bus, authStore, sheets, getStatus, getKpis, getDiagnostics, shutdown, backup }
 }

@@ -118,7 +118,7 @@ test("end to end: login, link on demand, auto capture, groups from the account, 
     const indian = st.groups.find((g) => g.jid === G1);
 
     // ---- start logging → capture runs; messages (text only) arrive live ----
-    const sess = await post("/api/sessions", { groupId: indian.id, label: "Race 1 · Mysore", raceNumber: 1 });
+    const sess = await post("/api/sessions", { groupId: indian.id, label: "RACE 1 · Mysore", raceNumber: 1 });
     assert.equal(sess.status, 200);
     assert.equal((await post("/api/sessions", { groupId: indian.id, label: "again" })).json.id, sess.json.id, "start is idempotent");
     await until(async () => (await get("/api/status")).capture.state === "capturing");

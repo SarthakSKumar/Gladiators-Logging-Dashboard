@@ -68,6 +68,7 @@ export const makePipeline = ({
   epoch = "test-epoch",
   onDurable,
   onUndecryptable,
+  inSession,
 } = {}) => {
   mkdirSync(join(dir, "journal"), { recursive: true });
   const db = openDb(join(dir, "messages.db"), "messages");
@@ -110,6 +111,7 @@ export const makePipeline = ({
     },
     onPressure: (on, reason) => pressure.push({ on, reason }),
     onUndecryptable,
+    inSession: inSession ? (jid, ts) => inSession(db, groups, jid, ts) : undefined,
   });
   const check = () =>
     counters.check({

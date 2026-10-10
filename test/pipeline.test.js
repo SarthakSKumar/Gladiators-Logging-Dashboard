@@ -249,3 +249,37 @@ test("restart replays journaled-but-unapplied records exactly once", async () =>
   assert.ok(p2.check().ok, JSON.stringify(p2.check()));
   p2.close();
 });
+
+test("only messages sent inside a logging session window are stored (no idle backlog)", async () => {
+  const sessionAt = (db, groups, jid, ts) => {
+    const g = groups.targetOf(jid);
+    return Boolean(
+      g &&
+        db
+          .prepare("SELECT 1 FROM sessions WHERE group_id = ? AND (started_at / 1000) * 1000 <= ? AND (ended_at IS NULL OR ? < (ended_at / 1000) * 1000)")
+          .get(g.id, ts, ts),
+    );
+  };
+  const p = makePipeline({ inSession: sessionAt });
+  const gid = p.groups.targetOf(G1).id;
+  // a session from 1_790_000_100 s to 1_790_000_200 s (ended), and nothing open for G2
+  p.db.prepare("INSERT INTO sessions (group_id, label, started_at, ended_at) VALUES (?, 'R1', ?, ?)").run(gid, 1_790_000_100_000, 1_790_000_200_000);
+  p.intake.enqueue(
+    upsert(
+      [
+        msg({ id: "BEFORE", ts: 1_790_000_050 }), // idle backlog, sent before Start → dropped
+        msg({ id: "IN1", ts: 1_790_000_100 }),
+        msg({ id: "IN2", ts: 1_790_000_199 }), // sent before Stop, delivered late → kept
+        msg({ id: "AFTER", ts: 1_790_000_250 }), // after Stop → dropped
+        msg({ id: "OTHER", chat: G2, ts: 1_790_000_150 }), // group with no session → dropped
+      ],
+      "append",
+    ),
+  );
+  await p.intake.idle();
+  p.committer.tick();
+  assert.deepEqual(p.db.prepare("SELECT wa_msg_id FROM messages ORDER BY wa_msg_id").pluck().all(), ["IN1", "IN2"]);
+  assert.equal(p.counters.c.excluded_out_of_session, 3);
+  assert.ok(p.check().ok, JSON.stringify(p.check()));
+  p.close();
+});

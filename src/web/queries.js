@@ -7,7 +7,10 @@ const ROW_COLUMNS = `v.seq, v.sno, v.group_id, v.chat_jid, v.wa_msg_id, v.wa_tim
      AND e.event_type IN ('edit','content_resolved') ORDER BY e.event_ts DESC, e.seq DESC LIMIT 1) AS latest_body,
   EXISTS (SELECT 1 FROM message_events e WHERE e.chat_jid = v.chat_jid AND e.target_wa_msg_id = v.wa_msg_id AND e.event_type = 'edit') AS edited,
   EXISTS (SELECT 1 FROM message_events e WHERE e.chat_jid = v.chat_jid AND e.target_wa_msg_id = v.wa_msg_id AND e.event_type = 'revoke') AS deleted,
-  c.push_name AS contact_name, t.label AS member_tag`
+  c.push_name AS contact_name, t.label AS member_tag,
+  (SELECT o.status FROM sheet_outbox o WHERE o.message_seq = v.seq) AS sheet_status,
+  (SELECT o.row_id FROM sheet_outbox o WHERE o.message_seq = v.seq) AS sheet_row,
+  (SELECT o.last_error FROM sheet_outbox o WHERE o.message_seq = v.seq) AS sheet_error`
 
 const JOINS = `LEFT JOIN contacts c ON c.jid = v.sender_jid
   LEFT JOIN member_tags t ON t.group_jid = v.chat_jid AND t.participant = v.sender_jid`

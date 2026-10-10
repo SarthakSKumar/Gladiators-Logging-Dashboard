@@ -103,18 +103,18 @@ export const createConnection = ({
     if (u.connection === 'open') {
       badSession = 0
       const me = sock.user ? { id: sock.user.id, lid: sock.user.lid, name: sock.user.name } : null
-      set({ phase: 'syncing', qr: null, me, code: null, nextRetryAt: null, detail: 'Connected — receiving messages queued while offline…' })
+      set({ phase: 'syncing', qr: null, me, code: null, nextRetryAt: null, detail: 'Connected — finishing startup…' })
       stableTimer = setTimeout(() => { attempt = 0 }, T.stableMs)
-      pendingTimer = setTimeout(() => { if (state.phase === 'syncing') goOnline(true) }, T.pendingFlagTimeoutMs)
+      pendingTimer = setTimeout(() => { if (state.phase === 'syncing') goOnline() }, T.pendingFlagTimeoutMs)
       if (pendingDone) goOnline()
       onOpen?.(sock)
     }
     if (u.connection === 'close') onClose(u.lastDisconnect)
   }
 
-  const goOnline = (noMarker = false) => {
+  const goOnline = () => {
     clearTimeout(pendingTimer)
-    set({ phase: 'online', attempt: 0, detail: noMarker ? 'Online (offline-backlog marker not received within 60 s)' : 'Online' })
+    set({ phase: 'online', attempt: 0, detail: 'Online' })
   }
 
   const backoff = (code, detail) => {

@@ -1,0 +1,16 @@
+{
+  "targets": [
+    {
+      "key": "indian",
+      "groupJid": "1203630000000000@g.us",
+      "groupName": "Gladiators Indian Racing 🏇",
+      "url": "https://script.google.com/macros/s/<deployment-id>/exec"
+    },
+    {
+      "key": "international",
+      "groupJid": "1203630000000001@g.us",
+      "groupName": "Gladiators International Racing 🏇",
+      "url": "https://script.google.com/macros/s/<deployment-id>/exec"
+    }
+  ]
+}

@@ -101,6 +101,10 @@ export const createWebServer = (deps) => {
   }))
   app.delete('/api/groups/:id', wrap(req => actions.removeGroup(int(req.params.id), req.admin.email)))
 
+  // custom integration: Google Sheets forwarding (two Gladiators groups)
+  app.get('/api/integrations/sheets', wrap(() => actions.sheets.status()))
+  app.post('/api/integrations/sheets/retry', wrap(req => actions.sheets.retry(req.body?.target)))
+
   // WhatsApp link lifecycle
   app.post('/api/wa/link', wrap(() => actions.link()))
   app.post('/api/wa/restart', wrap(() => actions.restart()))

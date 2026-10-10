@@ -7,7 +7,12 @@ import { normalize } from '../wa/normalize.js'
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const MESSAGE_PATHS = ['messages.upsert', 'messaging-history.set']
 
-export const createIntake = ({ journal, groups, counters, limits, log, onDurable, onPressure, onMetadata, onUndecryptable, now = Date.now }) => {
+/**
+ * inSession(chatJid, waTimestampMs): only messages *sent* inside a logging session window of their group are
+ * stored (anything else — before Start, after Stop, or WhatsApp's offline backlog from idle time — is dropped).
+ * Omitted (tests of the raw pipeline) → every in-scope message is kept.
+ */
+export const createIntake = ({ journal, groups, counters, limits, log, onDurable, onPressure, onMetadata, onUndecryptable, inSession, now = Date.now }) => {
   const c = counters.c
   const queue = [] // [{ events, at, records }]
   let queuedRecords = 0
@@ -75,6 +80,7 @@ export const createIntake = ({ journal, groups, counters, limits, log, onDurable
           continue
         }
         if (rec.kind === 'ignored') { c.excluded_type++; continue } // non-text: silently ignored by design
+        if (inSession && !inSession(chat, rec.wa_timestamp ?? now())) { c.excluded_out_of_session++; continue }
         if (rec.kind === 'undecryptable') {
           c.undecryptable++
           if (scope === 'target') onUndecryptable?.(rec)
