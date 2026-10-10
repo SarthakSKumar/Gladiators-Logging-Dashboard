@@ -1,24 +1,24 @@
-// HTTP: static UI, REST API, SSE stream. Binds to localhost; Caddy terminates HTTPS in front.
+// HTTP: built dashboard (web/dist), REST API, SSE stream. Binds to localhost; Caddy terminates HTTPS.
 import express from 'express'
+import { existsSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
-import { eventsAfter, latestPerGroup, listMessages, maxSeqs, messageHistory, messagesAfter } from './queries.js'
+import { eventsAfter, listMessages, maxSeqs, messageHistory, messagesAfter } from './queries.js'
 
-const PUBLIC = join(import.meta.dirname, '..', '..', 'public')
+const DIST = join(import.meta.dirname, '..', '..', 'web', 'dist')
 
 export const createWebServer = (deps) => {
-  const { config, db, auth, bus, log, getStatus, getDiagnostics, actions } = deps
+  const { config, db, auth, bus, log, getStatus, getDiagnostics, getKpis, ops, actions } = deps
   const app = express()
   app.disable('x-powered-by')
   app.set('trust proxy', 'loopback') // req.ip = client address forwarded by Caddy
 
   app.use((req, res, next) => {
     res.set({
-      'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+      'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
       'X-Frame-Options': 'DENY',
       'X-Content-Type-Options': 'nosniff',
-      'Referrer-Policy': 'no-referrer',
-      'Cache-Control': 'no-store'
+      'Referrer-Policy': 'no-referrer'
     })
     next()
   })
@@ -26,6 +26,7 @@ export const createWebServer = (deps) => {
 
   // State-changing requests: same-origin only (SameSite=Strict cookie + custom header + Origin check)
   app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store')
     if (req.method === 'GET') return next()
     const origin = req.headers.origin
     const okOrigin = !origin || origin === config.publicOrigin || origin === `${req.protocol}://${req.headers.host}`
@@ -42,6 +43,8 @@ export const createWebServer = (deps) => {
       if (!res.headersSent) res.status(err.status || 500).json({ error: err.status ? err.message : 'Internal error' })
     }
   }
+  const int = v => (v === undefined || v === '' ? undefined : Number.parseInt(v, 10))
+  const notFound = msg => Object.assign(new Error(msg), { status: 404 })
 
   // ---- auth (public) ----
   app.post('/api/auth/request-otp', wrap(async req => { await auth.requestOtp(req.body?.email, req.ip); return { ok: true } }))
@@ -56,14 +59,7 @@ export const createWebServer = (deps) => {
     res.setHeader('Set-Cookie', auth.cookie('', 0, config.cookieSecure))
     return { ok: true }
   }))
-
-  // ---- pages ----
-  app.get(['/', '/index.html'], (req, res) => {
-    if (!auth.sessionOf(req)) return res.redirect('/login.html')
-    res.sendFile(join(PUBLIC, 'index.html'))
-  })
-  app.get('/login.html', (req, res) => (auth.sessionOf(req) ? res.redirect('/') : res.sendFile(join(PUBLIC, 'login.html'))))
-  app.use(express.static(PUBLIC, { index: false }))
+  app.get('/api/health', (req, res) => res.json({ ok: true, serverTime: Date.now() })) // liveness only, no data
 
   // ---- everything below requires a session ----
   app.use('/api', (req, res, next) => {
@@ -75,45 +71,54 @@ export const createWebServer = (deps) => {
 
   app.get('/api/auth/me', wrap(req => ({ email: req.admin.email, name: req.admin.name, expiresAt: req.admin.expiresAt })))
   app.get('/api/status', wrap(() => getStatus()))
+  app.get('/api/kpis', wrap(() => getKpis()))
   app.get('/api/diagnostics', wrap(() => getDiagnostics()))
+  app.get('/api/events', wrap(req => ops.list({ limit: int(req.query.limit) ?? 200, beforeId: int(req.query.beforeId), minLevel: req.query.minLevel })))
 
-  const int = v => (v === undefined || v === '' ? undefined : Number.parseInt(v, 10))
+  // messages (text only) — a group's whole history or one session's window
   app.get('/api/messages', wrap(req => {
-    const groupId = int(req.query.group)
     const sessionId = int(req.query.session)
     const session = sessionId ? actions.sessions.get(sessionId) : null
-    if (sessionId && !session) throw Object.assign(new Error('Unknown session'), { status: 404 })
-    return { ...listMessages(db, { groupId: session?.group_id ?? groupId, session, beforeSno: int(req.query.beforeSno), limit: int(req.query.limit) ?? 200 }), cursor: maxSeqs(db) }
+    if (sessionId && !session) throw notFound('Unknown session')
+    const groupId = session?.group_id ?? int(req.query.group)
+    if (!groupId) throw Object.assign(new Error('group or session is required'), { status: 400 })
+    return { ...listMessages(db, { groupId, session, beforeSno: int(req.query.beforeSno), limit: int(req.query.limit) ?? 200 }), cursor: maxSeqs(db) }
   }))
-  app.get('/api/messages/:seq/history', wrap(req => messageHistory(db, int(req.params.seq)) ?? Promise.reject(Object.assign(new Error('Not found'), { status: 404 }))))
+  app.get('/api/messages/:seq/history', wrap(req => messageHistory(db, int(req.params.seq)) ?? Promise.reject(notFound('Not found'))))
 
-  app.get('/api/sessions', wrap(req => actions.sessions.list({ groupId: int(req.query.group) })))
+  // sessions (= "logging" for a group)
+  app.get('/api/sessions', wrap(req => actions.sessions.list({ groupId: int(req.query.group), limit: int(req.query.limit) ?? 100 })))
   app.post('/api/sessions', wrap(req => actions.sessions.start({ groupId: int(req.body?.groupId), label: req.body?.label, raceNumber: req.body?.raceNumber, by: req.admin.email })))
   app.post('/api/sessions/:id/stop', wrap(req => actions.sessions.stop({ id: int(req.params.id), by: req.admin.email })))
 
-  app.post('/api/groups/recheck', wrap(() => actions.recheckGroups()))
-  app.post('/api/groups/:key/pick', wrap(req => actions.pickGroup(req.params.key, req.body?.jid)))
-  app.post('/api/config/reload', wrap(() => actions.reloadConfig()))
+  // groups: the linked account's groups, and the selection
+  app.get('/api/wa/groups', wrap(() => actions.accountGroups()))
+  app.post('/api/wa/groups/refresh', wrap(() => actions.refreshAccountGroups()))
+  app.get('/api/groups', wrap(() => getStatus().groups))
+  app.post('/api/groups', wrap(req => {
+    if (typeof req.body?.jid !== 'string' || !req.body.jid.endsWith('@g.us')) throw Object.assign(new Error('jid must be a group id (…@g.us)'), { status: 400 })
+    return actions.addGroup(req.body.jid)
+  }))
+  app.delete('/api/groups/:id', wrap(req => actions.removeGroup(int(req.params.id), req.admin.email)))
 
-  app.post('/api/wa/restart', wrap(() => actions.wa('restart')))
-  app.post('/api/wa/show-qr', wrap(() => actions.wa('showQr')))
-  app.post('/api/wa/resume', wrap(() => actions.wa('resume')))
+  // WhatsApp link lifecycle
+  app.post('/api/wa/link', wrap(() => actions.link()))
+  app.post('/api/wa/restart', wrap(() => actions.restart()))
   app.post('/api/wa/unlink', wrap(req => {
     if (req.body?.confirm !== 'UNLINK') throw Object.assign(new Error('Type UNLINK to confirm'), { status: 400 })
-    return actions.wa('unlink', req.admin.email)
+    return actions.unlink(req.admin.email)
   }))
   app.post('/api/wa/operator-relink', wrap(req => {
     if (req.body?.confirm !== 'RELINK') throw Object.assign(new Error('Type RELINK to confirm'), { status: 400 })
     return actions.operatorRelink(req.admin.email)
   }))
-  app.post('/api/backup', wrap(() => actions.backup()))
 
-  // ---- live stream (SSE). The DB is the source; each client tails it from its own cursor. ----
+  // ---- live stream (SSE): status, new messages, operator events, ping ----
   app.get('/api/stream', (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' })
     const start = maxSeqs(db)
     const last = int(req.headers['last-event-id']) ?? int(req.query.since)
-    let cur = { msg: last ?? start.msg, evt: int(req.query.sinceEvt) ?? start.evt }
+    const cur = { msg: last ?? start.msg, evt: int(req.query.sinceEvt) ?? start.evt }
     let closed = false
     const send = (event, data, id) => {
       if (closed) return
@@ -122,7 +127,7 @@ export const createWebServer = (deps) => {
     }
     const pump = () => {
       for (let rows; !closed && (rows = messagesAfter(db, cur.msg)).length;) {
-        for (const r of rows) send('msg', r, r.seq)
+        for (const r of rows) if (r.msg_type === 'text') send('msg', r, r.seq)
         cur.msg = rows.at(-1).seq
       }
       for (let evs; !closed && (evs = eventsAfter(db, cur.evt)).length;) {
@@ -131,22 +136,32 @@ export const createWebServer = (deps) => {
       }
     }
     const onStatus = s => send('status', s)
+    const onOp = e => send('opevent', e)
     bus.on('committed', pump)
     bus.on('status', onStatus)
+    bus.on('opevent', onOp)
     send('status', getStatus())
     pump()
-    const ping = setInterval(() => !closed && res.write(': ping\n\n'), 15_000)
-    req.on('close', () => { closed = true; clearInterval(ping); bus.off('committed', pump); bus.off('status', onStatus) })
+    const ping = setInterval(() => send('ping', { t: Date.now() }), 10_000)
+    req.on('close', () => { closed = true; clearInterval(ping); bus.off('committed', pump); bus.off('status', onStatus); bus.off('opevent', onOp) })
   })
 
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }))
+
+  // ---- dashboard (built SPA). Hashed assets are immutable; every other path serves index.html ----
+  if (existsSync(DIST)) {
+    app.use('/assets', express.static(join(DIST, 'assets'), { immutable: true, maxAge: '1y' }))
+    app.use(express.static(DIST, { index: false }))
+    app.get(/^\/(?!api\/).*/, (req, res) => { res.set('Cache-Control', 'no-cache'); res.sendFile(join(DIST, 'index.html')) })
+  } else {
+    app.get('/', (req, res) => res.status(503).type('text').send('Dashboard not built. Run: pnpm build:web'))
+  }
 
   const server = createServer(app)
   return {
     app,
     listen: () => new Promise(resolve => server.listen(config.port, config.host, resolve)),
     close: () => new Promise(resolve => { server.closeAllConnections?.(); server.close(resolve) }),
-    port: () => server.address()?.port,
-    latestPerGroup: () => latestPerGroup(db)
+    port: () => server.address()?.port
   }
 }

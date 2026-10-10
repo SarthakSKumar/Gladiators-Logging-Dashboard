@@ -17,7 +17,8 @@ const JOINS = `LEFT JOIN contacts c ON c.jid = v.sender_jid
  * S. No. = position in send order (wa_timestamp, seq) within the view.
  */
 export const listMessages = (db, { groupId, session, beforeSno, limit = 200 }) => {
-  const w = session ? sessionWindow(session) : { sql: 'm.group_id = ?', params: [groupId] }
+  const base = session ? sessionWindow(session) : { sql: 'm.group_id = ?', params: [groupId] }
+  const w = { sql: `${base.sql} AND m.msg_type = 'text'`, params: base.params }
   const total = db.prepare(`SELECT count(*) FROM messages m WHERE ${w.sql}`).pluck().get(...w.params)
   const rows = db.prepare(`WITH v AS (
       SELECT m.*, ROW_NUMBER() OVER (ORDER BY m.wa_timestamp, m.seq) AS sno FROM messages m WHERE ${w.sql})
@@ -45,9 +46,3 @@ export const messageHistory = (db, seq) => {
     .all(m.chat_jid, m.wa_msg_id)
   return { message: m, events }
 }
-
-export const latestPerGroup = db => db.prepare(`SELECT m.group_id, m.wa_timestamp, m.received_at, m.msg_type, substr(m.body, 1, 120) AS body,
-    coalesce(t.label, m.push_name, c.push_name, m.sender_pn, m.sender_jid) AS sender
-  FROM messages m JOIN (SELECT group_id, max(seq) AS seq FROM messages GROUP BY group_id) x ON x.seq = m.seq
-  LEFT JOIN contacts c ON c.jid = m.sender_jid
-  LEFT JOIN member_tags t ON t.group_jid = m.chat_jid AND t.participant = m.sender_jid`).all()

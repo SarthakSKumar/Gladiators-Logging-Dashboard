@@ -63,8 +63,9 @@ test("duplicates: replaying the same batches 5x creates no extra rows; excluded 
   p.close();
 });
 
-test("edit before original, revoke, late decryption: originals immutable, events appended once", async () => {
-  const p = makePipeline();
+test("text only: protocol messages (edit/revoke) are ignored; undecryptable is reported, then stored if text arrives later", async () => {
+  const undecryptable = [];
+  const p = makePipeline({ onUndecryptable: (r) => undecryptable.push(r) });
   p.intake.enqueue(
     upsert([
       msg({
@@ -77,73 +78,34 @@ test("edit before original, revoke, late decryption: originals immutable, events
           },
         },
       }),
-    ]),
-  );
-  p.intake.enqueue(upsert([msg({ id: "O1", text: "v1" })]));
-  p.intake.enqueue(
-    upsert([
+      msg({ id: "O1", text: "v1" }),
       msg({
         id: "R1",
         message: { protocolMessage: { type: PT.REVOKE, key: { id: "O1" } } },
       }),
-    ]),
-  );
-  p.intake.enqueue(
-    upsert([
-      msg({
-        id: "R1",
-        message: { protocolMessage: { type: PT.REVOKE, key: { id: "O1" } } },
-      }),
-    ]),
-  ); // duplicate delivery
-  p.intake.enqueue(
-    upsert([
       msg({
         id: "C1",
         message: null,
         messageStubType: proto.WebMessageInfo.StubType.CIPHERTEXT,
+        messageStubParameters: ["No matching sessions"],
       }),
     ]),
   );
-  p.intake.enqueue(
-    upsert([msg({ id: "C1", text: "decrypted now" })], "notify"),
-  );
+  p.intake.enqueue(upsert([msg({ id: "C1", text: "decrypted now" })], "notify"));
   await p.intake.idle();
   p.committer.tick();
-  assert.equal(
-    count(p.db, "SELECT body FROM messages WHERE wa_msg_id = 'O1'"),
-    "v1",
-  );
-  assert.equal(
-    count(
-      p.db,
-      "SELECT count(*) FROM message_events WHERE target_wa_msg_id = 'O1' AND event_type = 'edit'",
-    ),
-    1,
-  );
-  assert.equal(
-    count(
-      p.db,
-      "SELECT count(*) FROM message_events WHERE target_wa_msg_id = 'O1' AND event_type = 'revoke'",
-    ),
-    1,
-  );
-  assert.equal(
-    count(p.db, "SELECT msg_type FROM messages WHERE wa_msg_id = 'C1'"),
-    "undecryptable",
-  );
-  assert.equal(
-    count(
-      p.db,
-      "SELECT new_body FROM message_events WHERE target_wa_msg_id = 'C1' AND event_type = 'content_resolved'",
-    ),
-    "decrypted now",
-  );
+  assert.equal(count(p.db, "SELECT body FROM messages WHERE wa_msg_id = 'O1'"), "v1");
+  assert.equal(count(p.db, "SELECT count(*) FROM message_events"), 0);
+  assert.equal(count(p.db, "SELECT body FROM messages WHERE wa_msg_id = 'C1'"), "decrypted now");
+  assert.equal(undecryptable.length, 1);
+  assert.equal(undecryptable[0].wa_msg_id, "C1");
+  assert.equal(p.counters.c.undecryptable, 1);
+  assert.equal(p.counters.c.excluded_type, 2);
   assert.ok(p.check().ok);
   p.close();
 });
 
-test("preflight safety: unknown-group messages are held while a group is unresolved, then promoted or purged", async () => {
+test("legacy groups.json rows: unknown-group messages are held until the row resolves by exact label, then promoted or purged", async () => {
   const p = makePipeline({
     groupsConfig: [
       { key: "g1", label: "Gladiators Test Group", jid: G1 },
@@ -163,54 +125,47 @@ test("preflight safety: unknown-group messages are held while a group is unresol
   assert.equal(count(p.db), 1);
   assert.equal(p.committer.pendingScopeOpen(), 2);
   assert.ok(p.check().ok);
-  // resolve: G2 matches the label exactly (after normalisation), OTHER does not
-  await p.groups.preflight(
-    async () => ({
-      [G1]: { id: G1, subject: "Gladiators Test Group" },
-      [G2]: { id: G2, subject: "  RACE  TALK INDIA 🏇 " },
-      [OTHER]: { id: OTHER, subject: "Something else" },
-    }),
-    { force: true },
-  );
+  await p.groups.refreshAccount(async () => ({
+    [G1]: { id: G1, subject: "Gladiators Test Group" },
+    [G2]: { id: G2, subject: "  Gladiators  Test Group 2 🏇 " },
+    [OTHER]: { id: OTHER, subject: "Something else" },
+  }));
   assert.equal(p.groups.allResolved(), true);
-  const r = p.committer.promotePending({
-    allResolved: true,
-    ttlMs: 86_400_000,
-  });
+  const r = p.committer.promotePending({ allResolved: true, ttlMs: 86_400_000 });
   assert.deepEqual(r, { promoted: 1, purged: 1 });
-  assert.equal(
-    count(p.db, "SELECT count(*) FROM messages WHERE chat_jid = ?", G2),
-    1,
-  );
+  assert.equal(count(p.db, "SELECT count(*) FROM messages WHERE chat_jid = ?", G2), 1);
   assert.equal(p.committer.pendingScopeOpen(), 0);
   assert.ok(p.check().ok, JSON.stringify(p.check()));
   p.close();
 });
 
-test("preflight reports ambiguous and missing groups with actions; pick resolves", async () => {
-  const p = makePipeline({
-    groupsConfig: [
-      { key: "a", label: "Gladiators Test Group" },
-      { key: "b", label: "Gladiators Test Group 2 🏇" },
-    ],
-  });
-  await p.groups.preflight(
-    async () => ({
-      x: { id: "x@g.us", subject: "Gladiators Test Group", size: 3 },
-      y: { id: "y@g.us", subject: "Gladiators Test Group", size: 40 },
-      z: { id: "z@g.us", subject: "Gladiators Test Group 2" },
-    }),
-    { force: true, me: "+91 98••••0000" },
-  );
-  const [a, b] = p.groups.list();
-  assert.equal(a.status, "ambiguous");
-  assert.equal(JSON.parse(a.candidates_json).length, 2);
-  assert.equal(b.status, "missing");
-  assert.match(b.action, /Ask a group admin to add \+91/);
-  assert.equal(JSON.parse(b.candidates_json)[0].id, "z@g.us"); // suggestion only, not auto-selected
-  p.groups.pick("a", "y@g.us");
-  assert.equal(p.groups.scopeOf("y@g.us"), "target");
-  assert.throws(() => p.groups.pick("a", "nope@g.us"));
+test("group selection: account list, add by id, remove keeps history, re-add restores, renames tracked by id", async () => {
+  const p = makePipeline({ groupsConfig: [] });
+  const G3 = "120363000000000003@g.us";
+  await p.groups.refreshAccount(async () => ({
+    [G1]: { id: G1, subject: "Alpha", size: 12 },
+    [G3]: { id: G3, subject: "Beta", size: 40 },
+  }));
+  assert.deepEqual(p.groups.accountGroups().map((g) => [g.subject, g.selected]), [["Alpha", false], ["Beta", false]]);
+  assert.throws(() => p.groups.add("999@g.us"), /not in the linked account/);
+  const added = p.groups.add(G3);
+  assert.equal(p.groups.scopeOf(G3), "target");
+  assert.equal(p.groups.scopeOf(G1), "non_target");
+  p.intake.enqueue(upsert([msg({ id: "S1", chat: G3 }), msg({ id: "S2", chat: G1 })]));
+  await p.intake.idle();
+  p.committer.tick();
+  assert.equal(count(p.db), 1);
+  p.groups.onGroupsUpdate([{ id: G3, subject: "Beta (renamed)" }]);
+  assert.equal(p.groups.list()[0].subject_current, "Beta (renamed)");
+  p.groups.remove(added.id);
+  assert.equal(p.groups.list().length, 0);
+  assert.equal(p.groups.scopeOf(G3), "non_target");
+  assert.equal(count(p.db), 1, "history kept");
+  const again = p.groups.add(G3);
+  assert.equal(again.id, added.id, "re-adding restores the same group row");
+  // a selected group the account left becomes inaccessible (still tracked by id)
+  await p.groups.refreshAccount(async () => ({ [G1]: { id: G1, subject: "Alpha" } }));
+  assert.equal(p.groups.get(added.id).status, "inaccessible");
   p.close();
 });
 
@@ -235,7 +190,7 @@ test("database failure: journal keeps capturing, committer retries and catches u
   p.close();
 });
 
-test("journal write failure: records stay in flight (at risk), socket suspension is requested, then recovery", async () => {
+test("journal write failure: records stay in flight (at risk), a capture pause is requested, then recovery", async () => {
   let failing = true;
   const p = makePipeline({
     journalHooks: {
@@ -258,25 +213,18 @@ test("journal write failure: records stay in flight (at risk), socket suspension
   p.close();
 });
 
-test("boundedness: intake queue over its limit requests suspension and releases it when drained", async () => {
-  const p = makePipeline({
-    limits: {
-      intakeMaxBatches: 2,
-      intakeMaxRecords: 1000,
-      chunkSize: 100,
-      chunkRetryMs: 200,
-    },
-  });
+test("metadata floods never suspend capture; the intake depth gauge drains (regression: suspend mid-sync)", async () => {
+  const p = makePipeline();
+  // right after linking Baileys emits many small metadata batches (contacts/chats/app-state)
+  for (let b = 0; b < 200; b++) p.intake.enqueue({ "contacts.update": [{ id: `${b}@s.whatsapp.net`, notify: "x" }] });
   for (let b = 0; b < 10; b++)
-    p.intake.enqueue(
-      upsert(Array.from({ length: 300 }, (_, i) => msg({ id: `Q${b}-${i}` }))),
-    );
-  const peak = p.intake.depth();
-  assert.ok(peak.batches > 2);
-  assert.ok(p.pressure[0]?.on && p.pressure[0].reason === "intake_queue");
+    p.intake.enqueue(upsert(Array.from({ length: 300 }, (_, i) => msg({ id: `Q${b}-${i}` }))));
+  assert.ok(p.intake.depth().batches > 4);
   await p.intake.idle();
-  assert.deepEqual(p.intake.depth(), { batches: 0, records: 0 });
-  assert.equal(p.pressure.at(-1).on, false);
+  assert.equal(p.pressure.length, 0, "no suspension requested");
+  assert.equal(p.intake.depth().batches, 0);
+  assert.equal(p.intake.depth().records, 0);
+  assert.equal(p.intake.depth().peakRecords, 3000);
   p.committer.tick();
   assert.equal(count(p.db), 3000);
   p.close();

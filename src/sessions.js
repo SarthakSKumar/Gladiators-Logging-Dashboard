@@ -27,13 +27,19 @@ export const createSessions = ({ db, now = Date.now, onChange }) => {
     }
     const g = db.prepare('SELECT id FROM groups WHERE id = ? AND enabled = 1').get(groupId)
     if (!g) throw httpError(404, 'Unknown group')
+    // idempotent: a repeated start (double click, retry) returns the session already running
+    const running = db.prepare('SELECT * FROM sessions WHERE group_id = ? AND ended_at IS NULL').get(groupId)
+    if (running) return running
     try {
       const { lastInsertRowid } = db.prepare('INSERT INTO sessions (group_id, label, race_number, started_at, started_by) VALUES (?, ?, ?, ?, ?)')
         .run(groupId, label, race, now(), by ?? null)
       onChange?.()
       return get(lastInsertRowid)
     } catch (err) {
-      if (String(err.code).startsWith('SQLITE_CONSTRAINT')) throw httpError(409, 'A session is already running for this group')
+      if (String(err.code).startsWith('SQLITE_CONSTRAINT') && String(err.message).includes('sessions')) {
+        const r = db.prepare('SELECT * FROM sessions WHERE group_id = ? AND ended_at IS NULL').get(groupId)
+        if (r) return r
+      }
       throw err
     }
   }
@@ -41,7 +47,7 @@ export const createSessions = ({ db, now = Date.now, onChange }) => {
   const stop = ({ id, by, reason = 'user' }) => {
     const s = get(id)
     if (!s) throw httpError(404, 'Unknown session')
-    if (s.ended_at != null) throw httpError(409, 'Session already ended')
+    if (s.ended_at != null) return s // idempotent: already stopped
     db.prepare('UPDATE sessions SET ended_at = ?, ended_by = ?, ended_reason = ? WHERE id = ? AND ended_at IS NULL').run(Math.max(now(), s.started_at), by ?? null, reason, id)
     onChange?.()
     return get(id)
@@ -49,11 +55,13 @@ export const createSessions = ({ db, now = Date.now, onChange }) => {
 
   const stats = s => {
     const w = sessionWindow(s)
-    const count = db.prepare(`SELECT count(*) FROM messages m WHERE ${w.sql}`).pluck().get(...w.params)
-    const late = s.ended_at == null ? 0 : db.prepare(`SELECT count(*) FROM messages m WHERE ${w.sql} AND m.received_at > ?`).pluck().get(...w.params, s.ended_at)
+    const count = db.prepare(`SELECT count(*) FROM messages m WHERE ${w.sql} AND m.msg_type = 'text'`).pluck().get(...w.params)
+    const late = s.ended_at == null ? 0 : db.prepare(`SELECT count(*) FROM messages m WHERE ${w.sql} AND m.msg_type = 'text' AND m.received_at > ?`).pluck().get(...w.params, s.ended_at)
     const end = s.ended_at ?? now()
+    // capture-off gaps that overlap the session (the brief "idle" gap before capture comes up at session
+    // start is not counted: WhatsApp delivers those messages as backlog on connect)
     const gaps = db.prepare(`SELECT id, started_at, ended_at, cause, status, recovered_messages FROM capture_gaps
-      WHERE started_at < ? AND coalesce(ended_at, ?) > ?`).all(end, now(), s.started_at)
+      WHERE started_at < ? AND coalesce(ended_at, ?) > ? AND cause NOT IN ('idle','not_linked','linking')`).all(end, now(), s.started_at)
     return { ...s, message_count: count, late_arrivals: late, gaps }
   }
 

@@ -1,103 +1,110 @@
-// Group configuration + preflight resolution (plan §9). Groups are identified by their stable
-// @g.us id; labels are only used to *find* that id, with exact matching after Unicode normalisation.
-import { loadGroupsConfig } from '../config.js'
+// Group selection. The database is the source of truth:
+//   account_groups — every group the linked account is in (cache of groupFetchAllParticipating)
+//   groups         — the groups selected for logging (enabled = 1), tracked by their stable @g.us id
+// config/groups.json is only imported once (upgrade path); legacy rows without an id are resolved by
+// exact label match on the next refresh.
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { getMeta, setMeta } from '../db/index.js'
 
 export const normLabel = s => String(s ?? '').normalize('NFC').trim().replace(/\s+/g, ' ')
-const loose = s => normLabel(s).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+const httpError = (status, message) => Object.assign(new Error(message), { status })
 
-export const createGroups = ({ db, log, now = Date.now, loadConfig = loadGroupsConfig }) => {
-  let byJid = new Map() // jid → row (resolved/inaccessible, enabled)
-  let anyUnresolved = true
-  let lastFetchAt = 0
+export const createGroups = ({ db, log, configDir, now = Date.now }) => {
+  let byJid = new Map()
+  let anyUnresolved = false
 
-  const rows = () => db.prepare('SELECT * FROM groups WHERE enabled = 1 ORDER BY id').all()
+  const selected = () => db.prepare('SELECT * FROM groups WHERE enabled = 1 ORDER BY id').all()
   const refresh = () => {
-    const all = rows()
+    const all = selected()
     byJid = new Map(all.filter(g => g.jid && (g.status === 'resolved' || g.status === 'inaccessible')).map(g => [g.jid, g]))
     anyUnresolved = all.some(g => !g.jid)
   }
 
-  /** Sync config/groups.json into the table. Removed entries are disabled, never deleted (history stays). */
-  const syncConfig = () => {
-    const cfg = loadConfig()
-    const t = now()
-    db.transaction(() => {
-      const upsert = db.prepare(`INSERT INTO groups (config_key, label, jid, pinned, status, enabled, updated_at)
-        VALUES (@key, @label, @jid, @pinned, @status, 1, @t)
-        ON CONFLICT(config_key) DO UPDATE SET label = excluded.label, enabled = 1, updated_at = excluded.updated_at,
-          jid = CASE WHEN excluded.pinned = 1 THEN excluded.jid ELSE groups.jid END,
-          pinned = CASE WHEN excluded.pinned = 1 THEN 1 ELSE groups.pinned END,
-          status = CASE WHEN excluded.pinned = 1 AND groups.jid IS NOT excluded.jid THEN 'resolved' ELSE groups.status END`)
-      for (const g of cfg) {
-        upsert.run({ key: g.key, label: g.label, jid: g.jid || null, pinned: g.jid ? 1 : 0, status: g.jid ? 'resolved' : 'unresolved', t })
-      }
-      const keys = cfg.map(g => g.key)
-      db.prepare(`UPDATE groups SET enabled = 0, updated_at = ? WHERE config_key NOT IN (${keys.map(() => '?').join(',') || "''"})`).run(t, ...keys)
-    })()
-    refresh()
+  /** One-time upgrade: import config/groups.json if the table has never been populated. */
+  const importLegacyConfig = () => {
+    if (getMeta(db, 'groups_config_imported')) return { imported: 0 }
+    const file = configDir ? join(configDir, 'groups.json') : null
+    let imported = 0
+    const hasRows = db.prepare('SELECT count(*) FROM groups').pluck().get() > 0
+    if (!hasRows && file && existsSync(file)) {
+      const cfg = JSON.parse(readFileSync(file, 'utf8'))
+      const ins = db.prepare(`INSERT OR IGNORE INTO groups (config_key, label, jid, pinned, status, enabled, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, ?)`)
+      for (const g of cfg) imported += ins.run(g.key, g.label, g.jid || null, g.jid ? 1 : 0, g.jid ? 'resolved' : 'unresolved', now()).changes
+    }
+    setMeta(db, 'groups_config_imported', new Date(now()).toISOString())
+    if (imported) log?.info({ imported }, 'groups: imported legacy config/groups.json')
+    return { imported }
   }
 
   /**
-   * Preflight: fetch every group the linked account participates in, resolve each configured label to
-   * exactly one id, report ambiguous/missing matches with the action needed.
-   * @param {() => Promise<Record<string, {id,subject,size?,participants?,creation?}>>} fetchAll
+   * Refresh the account's group list and re-check every selected group against it.
+   * @param {() => Promise<Record<string, {id, subject, size?, participants?, creation?}>>} fetchAll
    */
-  const preflight = async (fetchAll, { force = false, me } = {}) => {
-    if (!force && now() - lastFetchAt < 60_000) return { skipped: true }
-    lastFetchAt = now()
+  const refreshAccount = async fetchAll => {
     const fetched = Object.values(await fetchAll())
     const t = now()
-    const update = db.prepare(`UPDATE groups SET jid = @jid, subject_current = @subject, status = @status,
-      candidates_json = @candidates, action = @action, resolved_at = @resolved_at, updated_at = @t WHERE id = @id`)
-    const summary = []
     db.transaction(() => {
-      for (const g of rows()) {
-        const card = c => ({ id: c.id, subject: c.subject, size: c.size ?? c.participants?.length ?? null, creation: c.creation ?? null })
-        let next
-        if (g.jid && (g.pinned || g.status === 'resolved' || g.status === 'inaccessible')) {
+      const up = db.prepare(`INSERT INTO account_groups (jid, subject, size, creation, updated_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(jid) DO UPDATE SET subject = excluded.subject, size = excluded.size, creation = excluded.creation, updated_at = excluded.updated_at`)
+      for (const g of fetched) up.run(g.id, g.subject ?? null, g.size ?? g.participants?.length ?? null, g.creation ?? null, t)
+      db.prepare('DELETE FROM account_groups WHERE updated_at < ?').run(t)
+      setMeta(db, 'account_groups_fetched_at', t)
+
+      const upd = db.prepare('UPDATE groups SET jid = ?, subject_current = ?, status = ?, action = ?, resolved_at = coalesce(resolved_at, ?), updated_at = ? WHERE id = ?')
+      for (const g of selected()) {
+        if (g.jid) {
           const found = fetched.find(c => c.id === g.jid)
-          next = found
-            ? { jid: g.jid, subject: found.subject, status: 'resolved', candidates: null, action: null, resolved_at: g.resolved_at ?? t }
-            : { jid: g.jid, subject: g.subject_current, status: 'inaccessible', candidates: null, resolved_at: g.resolved_at,
-                action: `The linked number is no longer a participant of "${g.label}". Ask a group admin to add ${me || 'the linked number'} back, then click Re-check.` }
+          if (found) upd.run(g.jid, found.subject, 'resolved', null, t, t, g.id)
+          else upd.run(g.jid, g.subject_current, 'inaccessible', 'The linked number is no longer a member of this group. Ask a group admin to add it back.', null, t, g.id)
         } else {
+          // legacy row from groups.json: exact (normalised) label match only, never a guess
           const exact = fetched.filter(c => normLabel(c.subject) === normLabel(g.label))
-          if (exact.length === 1) {
-            next = { jid: exact[0].id, subject: exact[0].subject, status: 'resolved', candidates: null, action: null, resolved_at: t }
-          } else if (exact.length > 1) {
-            next = { jid: null, subject: null, status: 'ambiguous', candidates: JSON.stringify(exact.map(card)), resolved_at: null,
-                     action: `${exact.length} groups are named "${g.label}". Pick the right one below (compare member count / creation date).` }
-          } else {
-            const near = fetched.filter(c => loose(c.subject) === loose(g.label) || loose(c.subject).includes(loose(g.label)))
-            next = { jid: null, subject: null, status: 'missing', candidates: near.length ? JSON.stringify(near.map(card)) : null, resolved_at: null,
-                     action: `No group named exactly "${g.label}". Ask a group admin to add ${me || 'the linked number'} to it, then click Re-check.` +
-                       (near.length ? ' Similar names are listed as suggestions (not auto-selected).' : '') }
-          }
+          if (exact.length === 1) upd.run(exact[0].id, exact[0].subject, 'resolved', null, t, t, g.id)
+          else upd.run(null, null, exact.length ? 'ambiguous' : 'missing', exact.length ? 'Several groups have this name — remove it and add the right one from the list.' : 'No group with this exact name — remove it and add the group from the list.', null, t, g.id)
         }
-        update.run({ id: g.id, t, ...next })
-        summary.push({ key: g.config_key, label: g.label, status: next.status })
       }
     })()
     refresh()
-    log?.info({ summary }, 'groups: preflight')
-    return { summary }
+    log?.info({ groups: fetched.length }, 'groups: account list refreshed')
+    return fetched.length
   }
 
-  /** Operator picks one candidate for an ambiguous group (or confirms a near-match). */
-  const pick = (configKey, jid) => {
-    const g = db.prepare('SELECT * FROM groups WHERE config_key = ?').get(configKey)
-    if (!g) throw Object.assign(new Error('unknown group'), { status: 404 })
-    const candidates = JSON.parse(g.candidates_json || '[]')
-    const c = candidates.find(x => x.id === jid)
-    if (!c) throw Object.assign(new Error('jid is not one of the listed candidates'), { status: 400 })
-    db.prepare(`UPDATE groups SET jid = ?, subject_current = ?, status = 'resolved', pinned = 1, candidates_json = NULL,
-      action = NULL, resolved_at = ?, updated_at = ? WHERE id = ?`).run(jid, c.subject, now(), now(), g.id)
+  const accountGroups = () => db.prepare(`SELECT a.jid, a.subject, a.size, a.creation, a.updated_at,
+      g.id AS group_id, coalesce(g.enabled, 0) AS selected
+    FROM account_groups a LEFT JOIN groups g ON g.jid = a.jid ORDER BY a.subject COLLATE NOCASE`).all()
+    .map(r => ({ ...r, selected: Boolean(r.selected) }))
+
+  const add = jid => {
+    const acct = db.prepare('SELECT * FROM account_groups WHERE jid = ?').get(jid)
+    if (!acct) throw httpError(404, 'That group is not in the linked account’s group list. Refresh the list and try again.')
+    const t = now()
+    const existing = db.prepare('SELECT * FROM groups WHERE jid = ?').get(jid)
+    if (existing) {
+      db.prepare("UPDATE groups SET enabled = 1, status = 'resolved', action = NULL, subject_current = ?, updated_at = ? WHERE id = ?").run(acct.subject, t, existing.id)
+    } else {
+      db.prepare(`INSERT INTO groups (config_key, label, jid, subject_current, status, pinned, enabled, resolved_at, updated_at)
+        VALUES (?, ?, ?, ?, 'resolved', 1, 1, ?, ?)`).run(jid, acct.subject || jid, jid, acct.subject, t, t)
+    }
     refresh()
+    return db.prepare('SELECT * FROM groups WHERE jid = ?').get(jid)
+  }
+
+  /** Deselect (history is kept; re-adding the same group restores it). */
+  const remove = id => {
+    const g = db.prepare('SELECT * FROM groups WHERE id = ? AND enabled = 1').get(id)
+    if (!g) throw httpError(404, 'Unknown group')
+    db.prepare('UPDATE groups SET enabled = 0, updated_at = ? WHERE id = ?').run(now(), id)
+    refresh()
+    return g
   }
 
   const onGroupsUpdate = updates => {
     for (const u of updates) {
-      if (!u.id || !byJid.has(u.id) || u.subject === undefined) continue
+      if (!u.id || u.subject === undefined) continue
+      db.prepare('UPDATE account_groups SET subject = ?, updated_at = ? WHERE jid = ?').run(u.subject, now(), u.id)
+      if (!byJid.has(u.id)) continue
       db.prepare('UPDATE groups SET subject_current = ?, updated_at = ? WHERE jid = ?').run(u.subject, now(), u.id)
       log?.info({ jid: u.id, subject: u.subject }, 'groups: renamed (still tracked by id)')
     }
@@ -105,23 +112,28 @@ export const createGroups = ({ db, log, now = Date.now, loadConfig = loadGroupsC
   }
 
   const onParticipantsUpdate = ({ id, participants, action }, meIds) => {
-    if (!byJid.has(id) || action !== 'remove') return
+    if (!byJid.has(id) || action !== 'remove') return false
     const removedMe = participants.some(p => meIds.includes(typeof p === 'string' ? p : p.id) || meIds.includes(p.phoneNumber) || meIds.includes(p.lid))
-    if (!removedMe) return
-    db.prepare(`UPDATE groups SET status = 'inaccessible', action = ?, updated_at = ? WHERE jid = ?`)
-      .run('The linked number was removed from this group. Ask an admin to add it back, then click Re-check.', now(), id)
+    if (!removedMe) return false
+    db.prepare("UPDATE groups SET status = 'inaccessible', action = ?, updated_at = ? WHERE jid = ?")
+      .run('The linked number was removed from this group. Ask an admin to add it back.', now(), id)
     refresh()
+    return true
   }
 
   refresh()
   return {
-    syncConfig,
-    preflight,
-    pick,
+    importLegacyConfig,
+    refreshAccount,
+    accountGroups,
+    accountFetchedAt: () => Number(getMeta(db, 'account_groups_fetched_at') || 0) || null,
+    add,
+    remove,
     onGroupsUpdate,
     onParticipantsUpdate,
-    list: rows,
-    /** 'target' | 'pending' | 'non_target' — pending while any configured group is unresolved */
+    list: selected,
+    get: id => db.prepare('SELECT * FROM groups WHERE id = ?').get(id),
+    /** 'target' | 'pending' | 'non_target' — pending only while a legacy row awaits its id */
     scopeOf: jid => (byJid.has(jid) ? 'target' : anyUnresolved ? 'pending' : 'non_target'),
     targetOf: jid => byJid.get(jid) || null,
     allResolved: () => !anyUnresolved

@@ -48,6 +48,17 @@ export const LIMITS = {
   sseMaxBufferBytes: 1 << 20,
 };
 
+/** Seed the selected-groups table (rows without jid behave like legacy groups.json entries). */
+const seedGroups = (db, cfg) => {
+  if (db.prepare("SELECT count(*) FROM groups").pluck().get()) return;
+  const ins = db.prepare(
+    `INSERT INTO groups (config_key, label, jid, subject_current, status, pinned, enabled, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 1, 0)`,
+  );
+  for (const g of cfg)
+    ins.run(g.key, g.label, g.jid || null, g.jid ? g.label : null, g.jid ? "resolved" : "unresolved", g.jid ? 1 : 0);
+};
+
 /** Full ingestion pipeline on a temp dir with two pinned target groups (+ optional unresolved one). */
 export const makePipeline = ({
   dir = tmpDir(),
@@ -56,6 +67,7 @@ export const makePipeline = ({
   limits = LIMITS,
   epoch = "test-epoch",
   onDurable,
+  onUndecryptable,
 } = {}) => {
   mkdirSync(join(dir, "journal"), { recursive: true });
   const db = openDb(join(dir, "messages.db"), "messages");
@@ -67,16 +79,14 @@ export const makePipeline = ({
   });
   journal.open();
   const counters = createCounters();
-  const groups = createGroups({
+  seedGroups(
     db,
-    log: silent,
-    loadConfig: () =>
-      groupsConfig ?? [
-        { key: "g1", label: "Gladiators Test Group", jid: G1 },
-        { key: "g2", label: "Gladiators Test Group 2 🏇", jid: G2 },
-      ],
-  });
-  groups.syncConfig();
+    groupsConfig ?? [
+      { key: "g1", label: "Gladiators Test Group", jid: G1 },
+      { key: "g2", label: "Gladiators Test Group 2 🏇", jid: G2 },
+    ],
+  );
+  const groups = createGroups({ db, log: silent });
   const committer = createCommitter({
     db,
     journal,
@@ -99,6 +109,7 @@ export const makePipeline = ({
       committer.tick();
     },
     onPressure: (on, reason) => pressure.push({ on, reason }),
+    onUndecryptable,
   });
   const check = () =>
     counters.check({

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, statfsSync } from 'node:fs'
 import { join } from 'node:path'
+import pino from 'pino'
 import { isPnUser } from 'baileys'
 import { loadAdmins } from './config.js'
 import { getMeta, openDb, setMeta } from './db/index.js'
@@ -13,23 +14,26 @@ import { createCommitter } from './ingest/committer.js'
 import { createAuthStore } from './wa/authState.js'
 import { createGroups } from './wa/groups.js'
 import { createConnection } from './wa/connection.js'
+import { createCapture } from './capture.js'
 import { createSessions } from './sessions.js'
 import { createGaps } from './gaps.js'
 import { checkAuthRollback, recordHighWater, resolveAuthRollbackByRelink, resolveEpoch } from './fencing.js'
 import { createMailer } from './mailer.js'
 import { createAlerts } from './alerts.js'
+import { classifyBaileysLog, createOpsEvents } from './events.js'
 import { runBackup } from './backup.js'
 import { createWebAuth } from './web/auth.js'
 import { createWebServer } from './web/server.js'
 
-const OFFLINE_ALERT_GRACE_MS = 2 * 60_000
+const OUTAGE_ALERT_GRACE_MS = 2 * 60_000
+const httpError = (status, message) => Object.assign(new Error(message), { status })
 
 export const maskJid = jid => {
   const d = String(jid || '').split(/[@:]/)[0]
   return d.length > 6 ? `+${d.slice(0, 2)} ${d.slice(2, 4)}••••${d.slice(-4)}` : d
 }
 
-export const startApp = async ({ config, log, makeSocket, getVersion, mailer: mailerOverride, listen = true }) => {
+export const startApp = async ({ config, log, makeSocket, getVersion, mailer: mailerOverride, listen = true, connectionTiming }) => {
   const timers = []
   let closed = false
   const every = (ms, fn) => timers.push(setInterval(() => { try { fn() } catch (err) { log.error({ err: err.stack }, 'periodic task failed') } }, ms))
@@ -50,62 +54,59 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     throw err
   }
 
+  const ops = createOpsEvents({ db: msgDb, bus, log })
   const counters = createCounters()
   counters.c.torn_tail_bytes = journal.stats.tornTailBytes
   counters.c.quarantined_ranges = journal.stats.quarantinedRanges
+  if (journal.stats.tornTailBytes) ops.emit({ level: 'info', code: 'journal.torn_tail', message: `Recovered from an interrupted write (${journal.stats.tornTailBytes} unacknowledged bytes set aside)`, noise: true })
+  if (journal.stats.quarantinedRanges) ops.emit({ level: 'error', code: 'journal.corruption', message: `Journal corruption found and quarantined (${journal.stats.quarantinedRanges} range(s)); valid records were kept`, context: journal.stats })
 
   const authStore = createAuthStore(authDb, { log })
   const rollback = checkAuthRollback({ msgDb, authStore, journal })
   if (rollback.ok && ep.authEpochMissing) setMeta(authDb, 'data_epoch', ep.epoch)
 
   const mailer = mailerOverride ?? createMailer({ smtp: config.smtp, log })
-  const groups = createGroups({ db: msgDb, log })
-  groups.syncConfig()
+  const groups = createGroups({ db: msgDb, log, configDir: config.configDir })
+  groups.importLegacyConfig()
 
-  // ---- alerts + status fan-out ----
+  // ---- status fan-out (debounced) ----
+  let statusTimer = null
+  let getStatus = null
+  const pushStatus = () => {
+    if (statusTimer || closed) return
+    statusTimer = setTimeout(() => { statusTimer = null; if (!closed) { bus.emit('status', getStatus()); onCaptureMaybeChanged() } }, 150)
+  }
+
   let connection = null
+  let capture = null
   const alerts = createAlerts({
     loadAdmins, mailer, tz: config.displayTz, log,
-    whatsapp: { isOnline: () => connection?.isOnline(), send: (jid, text) => connection.sendText(jid, text) }
+    whatsapp: { isOnline: () => connection?.state().phase === 'online' && connection.usable(), send: (jid, text) => connection.sendText(jid, text) }
   })
-  let statusTimer = null
-  const pushStatus = () => {
-    if (statusTimer) return
-    statusTimer = setTimeout(() => { statusTimer = null; if (!closed) bus.emit('status', getStatus()) }, 250)
-  }
 
   const gaps = createGaps({
     db: msgDb, log,
     onClosed: g => {
       pushStatus()
-      if (g.status === 'unverified') {
-        alerts.notify({ title: 'Capture gap could not be verified', channels: ['email', 'whatsapp'],
-          detail: `Not capturing from ${new Date(g.started_at).toISOString()} to ${new Date(g.ended_at).toISOString()} (${g.cause}). WhatsApp gives no way to prove nothing was missed in this window.` })
+      if (g.status === 'unverified' && !['idle', 'not_linked', 'linking'].includes(g.cause)) {
+        const detail = `Capture was not running from ${new Date(g.started_at).toISOString()} to ${new Date(g.ended_at).toISOString()} (${g.cause}) while a group was logging. WhatsApp gives no way to prove nothing was missed.`
+        ops.emit({ level: 'warn', code: 'capture.gap_unverified', message: 'A capture gap could not be verified', context: { gapId: g.id, cause: g.cause, from: g.started_at, to: g.ended_at } })
+        alerts.notify({ title: 'Capture gap could not be verified', channels: ['email', 'whatsapp'], detail })
       }
     }
   })
-
-  // ---- backpressure: any active reason suspends the socket (WhatsApp keeps queueing for us) ----
-  const pressure = new Map()
-  const setPressure = (reason, on, detail) => {
-    const had = pressure.size > 0
-    if (on) pressure.set(reason, detail ?? true); else pressure.delete(reason)
-    if (!connection) return
-    if (pressure.size && !had) {
-      connection.suspend([...pressure.keys()].join(', '))
-      alerts.raise('suspended', { title: 'Capture paused to protect data', detail: `Reasons: ${[...pressure.keys()].join(', ')}. The socket is disconnected so WhatsApp keeps queueing messages; capture resumes automatically.` })
-    } else if (!pressure.size && had) {
-      connection.resume()
-      alerts.clear('suspended')
-    }
-    pushStatus()
-  }
 
   const committer = createCommitter({
     db: msgDb, journal, groups, counters, log,
     onCommitted: () => bus.emit('committed'),
     onHealth: (ok, err) => {
-      if (ok) alerts.clear('commit'); else alerts.raise('commit', { title: 'Database writes failing', channels: ['email', 'whatsapp'], detail: `Messages are safe in the journal and will be applied when the database recovers. Error: ${err?.code || err?.message}` })
+      if (ok) {
+        alerts.clear('commit')
+        ops.emit({ level: 'info', code: 'db.recovered', message: 'Database writes recovered; journaled messages applied' })
+      } else {
+        alerts.raise('commit', { title: 'Database writes failing', channels: ['email', 'whatsapp'], detail: `Messages are safe in the journal and will be applied when the database recovers. Error: ${err?.code || err?.message}` })
+        ops.emit({ level: 'error', code: 'db.commit_failed', message: `Database writes failing (${err?.code || err?.message}). Messages are safe in the journal and will be applied automatically.` })
+      }
       pushStatus()
     }
   })
@@ -120,13 +121,13 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     ON CONFLICT(jid) DO UPDATE SET push_name = coalesce(excluded.push_name, contacts.push_name), pn_jid = coalesce(excluded.pn_jid, contacts.pn_jid), updated_at = excluded.updated_at`)
   const meIds = () => { const me = connection?.state().me; return [me?.id, me?.lid, me?.id?.replace(/:\d+@/, '@'), me?.lid?.replace(/:\d+@/, '@')].filter(Boolean) }
 
-  let preflightRunning = null
-  const runPreflight = async (force = false) => {
-    if (!connection?.socket() || !['ONLINE', 'SYNCING'].includes(connection.state().state)) throw Object.assign(new Error('WhatsApp is not connected'), { status: 409 })
-    preflightRunning ??= groups.preflight(() => connection.fetchGroups(), { force, me: maskJid(connection.state().me?.id) })
-      .then(r => { committer.promotePending({ allResolved: groups.allResolved(), ttlMs: config.pendingScopeTtlMs }); pushStatus(); return r })
-      .finally(() => { preflightRunning = null })
-    return preflightRunning
+  // refresh the account's group list on an open socket (single-flight)
+  let groupRefresh = null
+  const refreshGroupsOnOpenSocket = () => {
+    groupRefresh ??= groups.refreshAccount(() => connection.fetchGroups())
+      .then(n => { committer.promotePending({ allResolved: groups.allResolved(), ttlMs: config.pendingScopeTtlMs }); pushStatus(); return n })
+      .finally(() => { groupRefresh = null })
+    return groupRefresh
   }
 
   const onMetadata = (name, data) => {
@@ -138,58 +139,103 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     } else if (name === 'groups.update') {
       groups.onGroupsUpdate(data); pushStatus()
     } else if (name === 'groups.upsert') {
-      if (!groups.allResolved()) runPreflight(true).catch(() => {})
+      if (connection.usable()) refreshGroupsOnOpenSocket().catch(() => {})
     } else if (name === 'group-participants.update') {
-      groups.onParticipantsUpdate(data, meIds())
-      if (data.action === 'add' && !groups.allResolved()) runPreflight(true).catch(() => {})
+      if (groups.onParticipantsUpdate(data, meIds())) {
+        const g = groups.targetOf(data.id)
+        ops.emit({ level: 'error', code: 'group.removed_from', message: `The linked number was removed from "${g?.label || data.id}". Messages there can no longer be captured.`, context: { jid: data.id } })
+      }
       pushStatus()
     } else if (name === 'group.member-tag.update') {
       msgDb.prepare(`INSERT INTO member_tags (group_jid, participant, label, updated_at) VALUES (?, ?, ?, ?)
         ON CONFLICT(group_jid, participant) DO UPDATE SET label = excluded.label, updated_at = excluded.updated_at`).run(data.groupId, data.participant, data.label || null, t)
-    } else if (name === 'messaging-history.status') {
-      log.info({ ...data }, 'wa: history sync status')
     }
   }
 
   const intake = createIntake({
     journal, groups, counters, limits: config.limits, log,
     onDurable: () => committer.tick(),
-    onPressure: (on, reason, detail) => setPressure(reason, on, detail),
-    onMetadata
-  })
-
-  // ---- connection + state-driven alerts/gaps ----
-  let offlineTimer = null
-  const OUTAGE_NOW = { NEEDS_LINK: 'WhatsApp needs to be linked (scan the QR in the dashboard)', REPLACED: 'Session replaced by another instance', RESTRICTED: 'WhatsApp refused the connection (account may be restricted)', NEEDS_OPERATOR: 'Operator action required', LINK_IDLE: 'WhatsApp is not linked' }
-  connection = createConnection({
-    authStore, intake, log, makeSocket, getVersion,
-    baileysLogger: log.child({ mod: 'baileys' }, { level: config.logLevel === 'debug' ? 'debug' : 'warn' }),
-    onOpen: () => runPreflight(true).catch(err => log.warn({ err: err.message }, 'groups: preflight failed')),
-    onLoggedOut: cause => gaps.open(cause),
-    onState: (s, changed) => {
-      if (closed) return
-      if (changed) {
-        msgDb.prepare('INSERT INTO connection_log (ts, state, code, detail) VALUES (?, ?, ?, ?)').run(Date.now(), s.state, s.code ?? null, s.detail ?? null)
-        if (s.state === 'ONLINE') {
-          gaps.close()
-          clearTimeout(offlineTimer); offlineTimer = null
-          for (const k of ['not_online', 'needs_link']) alerts.clear(k)
-        } else if (!['SYNCING'].includes(s.state)) {
-          gaps.open(s.state === 'SUSPENDED' ? 'suspended' : s.state.toLowerCase())
-          if (OUTAGE_NOW[s.state]) alerts.raise('needs_link', { title: OUTAGE_NOW[s.state], detail: s.detail })
-          else if (!offlineTimer && s.state !== 'STOPPED') {
-            offlineTimer = setTimeout(() => {
-              offlineTimer = null
-              if (connection.state().state !== 'ONLINE') alerts.raise('not_online', { title: 'WhatsApp capture is offline', detail: connection.state().detail })
-            }, OFFLINE_ALERT_GRACE_MS)
-          }
-        }
-      }
-      pushStatus()
+    onPressure: (on, reason, detail) => capture?.setPressure(reason, on, detail),
+    onMetadata,
+    onUndecryptable: rec => {
+      const g = groups.targetOf(rec.chat_jid)
+      ops.emit({
+        level: 'warn', code: 'ingest.undecryptable',
+        message: `A message in "${g?.label || rec.chat_jid}" could not be decrypted${rec.reason ? ` (${rec.reason})` : ''}. WhatsApp may resend it; if it arrives it is logged normally.`,
+        context: { group: g?.label, jid: rec.chat_jid, id: rec.wa_msg_id, sender: rec.sender_pn || rec.sender_jid, push_name: rec.push_name }
+      })
     }
   })
 
-  const sessions = createSessions({ db: msgDb, onChange: pushStatus })
+  // Baileys reports some failures only through its logger: classify those into operator events.
+  const baileysLogger = pino({
+    level: config.logLevel === 'debug' ? 'debug' : 'warn',
+    base: { mod: 'baileys' },
+    hooks: {
+      logMethod (args, method, level) {
+        try { if (!closed) classifyBaileysLog(level, args, { emit: ops.emit, groupOf: jid => groups.targetOf(jid) }) } catch { /* never break logging */ }
+        return method.apply(this, args)
+      }
+    }
+  })
+
+  const loggingCount = () => msgDb.prepare(`SELECT count(*) FROM sessions s JOIN groups g ON g.id = s.group_id
+    WHERE s.ended_at IS NULL AND g.enabled = 1 AND g.jid IS NOT NULL`).pluck().get()
+
+  // ---- connection + capture manager ----
+  let wasLinked = authStore.isRegistered()
+  connection = createConnection({
+    authStore, intake, log, baileysLogger, makeSocket, getVersion, events: ops, timing: connectionTiming,
+    shouldStayUp: () => capture.desiredUp(),
+    onOpen: () => refreshGroupsOnOpenSocket().catch(err => log.warn({ err: err.message }, 'groups: refresh on open failed')),
+    onLoggedOut: cause => {
+      gaps.open(cause)
+      if (cause === 'logged_out') alerts.raise('needs_link', { title: 'WhatsApp was logged out', detail: 'The logger device was removed or expired. Sign in to the dashboard and link it again.' })
+    },
+    onDown: s => {
+      if (!s.linked) capture.linkSettled() // QR expired / link failed: wait for "Regenerate"
+      capture.reconcile()
+    },
+    onState: (s, changed) => {
+      if (closed) return
+      if (changed) msgDb.prepare('INSERT INTO connection_log (ts, state, code, detail) VALUES (?, ?, ?, ?)').run(Date.now(), s.phase.toUpperCase(), s.code ?? null, s.detail ?? null)
+      if (s.linked && !wasLinked) {
+        // just linked: keep the socket up while WhatsApp finishes the initial sync and we read the group list
+        capture.linkSettled()
+        capture.lease('post-link-sync', 120_000)
+        alerts.clear('needs_link')
+      }
+      wasLinked = s.linked
+      capture?.observe()
+      pushStatus()
+    }
+  })
+  capture = createCapture({ connection, loggingCount, events: ops, log, onChange: pushStatus })
+
+  // gap + alert bookkeeping follows the *capture* state (gaps are recorded whenever capture is off)
+  let lastCapture = null
+  let outageTimer = null
+  const onCaptureMaybeChanged = () => {
+    const cs = capture.captureState()
+    if (cs.state === lastCapture) return
+    lastCapture = cs.state
+    if (cs.state === 'capturing') {
+      gaps.close()
+      clearTimeout(outageTimer); outageTimer = null
+      for (const k of ['not_online', 'capture_error']) alerts.clear(k)
+    } else {
+      gaps.open({ idle: 'idle', not_linked: 'not_linked', linking: 'linking', starting: 'connecting', error: cs.reason || 'error' }[cs.state] || cs.state)
+      if (cs.logging > 0 && !outageTimer && ['starting', 'error'].includes(cs.state)) {
+        outageTimer = setTimeout(() => {
+          outageTimer = null
+          const now = capture.captureState()
+          if (now.logging > 0 && now.state !== 'capturing') alerts.raise(now.state === 'error' ? 'capture_error' : 'not_online', { title: 'WhatsApp capture is not running while a group is logging', detail: now.detail })
+        }, OUTAGE_ALERT_GRACE_MS)
+      }
+    }
+  }
+
+  const sessions = createSessions({ db: msgDb, onChange: () => { capture.reconcile(); pushStatus() } })
 
   // ---- status / diagnostics ----
   const diskFree = () => {
@@ -204,32 +250,54 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
       intakeDepth: intake.depth(),
       inflight: counters.c.inflight,
       committerDegraded: committer.degraded(),
-      pressure: [...pressure.keys()],
+      pressure: capture.pressureReasons(),
       invariants: counters.check({ pending_apply, pending_scope_open }),
       latency: counters.latencyStats(),
       disk: diskFree()
     }
   }
-  let web = null
-  const getStatus = () => {
+  const textCount = msgDb.prepare("SELECT count(*) FROM messages WHERE group_id = ? AND msg_type = 'text'").pluck()
+  getStatus = () => {
     const s = connection.state()
-    const latest = Object.fromEntries((web?.latestPerGroup() || []).map(r => [r.group_id, r]))
     const active = Object.fromEntries(sessions.active().map(x => [x.group_id, sessions.stats(x)]))
+    const cs = capture.captureState()
+    const h = health()
     return {
       serverTime: Date.now(),
       tz: config.displayTz,
-      connection: { state: s.state, detail: s.detail, since: s.since, attempt: s.attempt, nextRetryAt: s.nextRetryAt, code: s.code, qr: s.qr, me: s.me ? { number: maskJid(s.me.id), name: s.me.name } : null },
+      linked: s.linked,
+      me: s.linked && s.me ? { name: s.me.name || null, number: maskJid(s.me.id) } : null,
+      capture: { ...cs, qr: cs.state === 'linking' ? s.qr : null, qrExpired: Boolean(s.qrExpired) },
       groups: groups.list().map(g => ({
-        id: g.id, key: g.config_key, label: g.label, jid: g.jid, subject: g.subject_current, status: g.status, action: g.action,
-        candidates: g.candidates_json ? JSON.parse(g.candidates_json) : null, lastMessageAt: g.last_message_at,
-        latest: latest[g.id] || null, session: active[g.id] || null,
-        count: msgDb.prepare('SELECT count(*) FROM messages WHERE group_id = ?').pluck().get(g.id)
+        id: g.id, jid: g.jid, label: g.subject_current || g.label, status: g.status, action: g.action,
+        lastMessageAt: g.last_message_at, session: active[g.id] || null, count: textCount.get(g.id)
       })),
       gapOpen: gaps.current() || null,
-      alerts: alerts.list(),
-      health: health()
+      health: { pendingApply: h.pendingApply, committerDegraded: h.committerDegraded, pressure: h.pressure, invariantsOk: h.invariants.ok }
     }
   }
+
+  const dayStartIst = () => {
+    const t = Date.now() + 5.5 * 3600_000
+    return t - (t % 86_400_000) - 5.5 * 3600_000
+  }
+  const getKpis = () => {
+    const q = (sql, ...p) => msgDb.prepare(sql).pluck().get(...p)
+    const sel = "group_id IN (SELECT id FROM groups WHERE enabled = 1)"
+    const today = dayStartIst()
+    return {
+      messagesAllTime: q(`SELECT count(*) FROM messages WHERE msg_type = 'text' AND ${sel}`),
+      messagesToday: q(`SELECT count(*) FROM messages WHERE msg_type = 'text' AND ${sel} AND wa_timestamp >= ?`, today),
+      lastMessageAt: q(`SELECT max(received_at) FROM messages WHERE msg_type = 'text' AND ${sel}`) || null,
+      groupsConfigured: q('SELECT count(*) FROM groups WHERE enabled = 1'),
+      groupsLogging: loggingCount(),
+      sessionsToday: q(`SELECT count(*) FROM sessions WHERE started_at >= ? AND ${sel}`, today),
+      ingestionFailuresToday: ops.countSince('ingest.', today, 'error') + ops.countSince('ingest.', today, 'warn'),
+      gapsToday: q("SELECT count(*) FROM capture_gaps WHERE started_at >= ? AND cause NOT IN ('idle','not_linked','linking')", today),
+      dayStart: today
+    }
+  }
+
   const getDiagnostics = () => ({
     counters: counters.c,
     health: health(),
@@ -237,35 +305,80 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     auth: { writeCounter: authStore.writeCounter(), keyTypes: authStore.keyTypes(), registered: authStore.isRegistered() },
     alerts: { active: alerts.list(), ...alerts.stats() },
     mailerConfigured: mailer.configured,
-    connectionLog: msgDb.prepare('SELECT * FROM connection_log ORDER BY id DESC LIMIT 100').all(),
+    connectionLog: msgDb.prepare('SELECT * FROM connection_log ORDER BY id DESC LIMIT 200').all(),
     gaps: gaps.list(),
-    process: { uptimeS: Math.round(process.uptime()), rssMb: Math.round(process.memoryUsage().rss / 1048576), node: process.version, pid: process.pid },
-    db: { pageCount: msgDb.pragma('page_count', { simple: true }), pageSize: msgDb.pragma('page_size', { simple: true }) }
+    process: { uptimeS: Math.round(process.uptime()), rssMb: Math.round(process.memoryUsage().rss / 1048576), node: process.version, pid: process.pid }
   })
 
   const backup = () => runBackup({ msgDb, authDb, journal, dir: config.backupDir, log })
 
-  const auth = createWebAuth({ db: msgDb, loadAdmins, mailer, secret: getMeta(msgDb, 'app_secret'), sessionTtlMs: config.sessionTtlMs, log })
-  web = createWebServer({
-    config, db: msgDb, auth, bus, log, getStatus, getDiagnostics,
+  // ---- group selection actions ----
+  const requireLinked = () => { if (!connection.state().linked) throw httpError(409, 'Link WhatsApp first') }
+  const refreshAccountGroups = async () => {
+    requireLinked()
+    const release = capture.lease('groups-refresh', 90_000)
+    try {
+      if (!(await connection.waitUsable(60_000))) throw httpError(503, `Could not reach WhatsApp to refresh groups (${connection.state().detail})`)
+      await refreshGroupsOnOpenSocket()
+      return { groups: groups.accountGroups(), fetchedAt: groups.accountFetchedAt() }
+    } finally { release() }
+  }
+
+  const auth = createWebAuth({ db: msgDb, loadAdmins, mailer, secret: getMeta(msgDb, 'app_secret'), sessionTtlMs: config.sessionTtlMs, log, devOtpToConsole: config.devOtpToConsole })
+  const web = createWebServer({
+    config, db: msgDb, auth, bus, log, getStatus, getDiagnostics, getKpis, ops,
     actions: {
-      sessions,
-      recheckGroups: () => runPreflight(true),
-      pickGroup: (key, jid) => { groups.pick(key, jid); committer.promotePending({ allResolved: groups.allResolved(), ttlMs: config.pendingScopeTtlMs }); pushStatus() },
-      reloadConfig: () => { groups.syncConfig(); pushStatus(); return runPreflight(true).catch(() => ({ preflight: 'deferred until connected' })) },
-      wa: async (op, by) => {
-        if (op === 'unlink') { log.warn({ by }, 'wa: unlink requested from dashboard'); await connection.unlink() } else connection[op]()
-        return { state: connection.state().state }
+      sessions: {
+        ...sessions,
+        start: args => {
+          requireLinked()
+          const g = groups.get(args.groupId)
+          if (!g?.enabled) throw httpError(404, 'Unknown group')
+          if (!g.jid || g.status !== 'resolved') throw httpError(409, g.action || 'This group is not available in the linked account')
+          const s = sessions.start(args)
+          ops.emit({ level: 'info', code: 'session.started', message: `Logging started for "${g.subject_current || g.label}"`, context: { group: g.id, session: s.id }, noise: true })
+          return s
+        },
+        stop: args => {
+          const s = sessions.stop(args)
+          ops.emit({ level: 'info', code: 'session.stopped', message: 'Logging stopped', context: { session: s.id }, noise: true })
+          return s
+        }
+      },
+      accountGroups: () => ({ groups: groups.accountGroups(), fetchedAt: groups.accountFetchedAt() }),
+      refreshAccountGroups,
+      addGroup: jid => { const g = groups.add(jid); committer.promotePending({ allResolved: groups.allResolved(), ttlMs: config.pendingScopeTtlMs }); pushStatus(); return g },
+      removeGroup: (id, by) => {
+        const active = sessions.active().find(s => s.group_id === id)
+        if (active) sessions.stop({ id: active.id, by, reason: 'group_removed' })
+        const g = groups.remove(id)
+        capture.reconcile(); pushStatus()
+        return g
+      },
+      link: async () => {
+        if (connection.state().blocked?.reason === 'operator') throw httpError(409, connection.state().blocked.detail)
+        await capture.requestLink()
+        return getStatus().capture
+      },
+      restart: async () => { await connection.restart(); await capture.reconcile(); return getStatus().capture },
+      unlink: async by => {
+        log.warn({ by }, 'wa: unlink requested from dashboard')
+        // unlinking on WhatsApp's side needs a connection: hold one briefly if capture is idle
+        const release = connection.state().linked ? capture.lease('unlink', 60_000) : () => {}
+        try {
+          await connection.waitUsable(20_000)
+          for (const s of sessions.active()) sessions.stop({ id: s.id, by, reason: 'unlinked' })
+          return await connection.unlink()
+        } finally { release(); capture.reconcile() }
       },
       operatorRelink: by => {
-        if (connection.state().state !== 'NEEDS_OPERATOR') throw Object.assign(new Error('No operator action pending'), { status: 409 })
+        if (connection.state().blocked?.reason !== 'operator') throw httpError(409, 'No operator action pending')
         log.warn({ by }, 'fencing: operator chose fresh link')
         resolveAuthRollbackByRelink({ msgDb, authDb, authStore, journal, epoch: ep.epoch })
         gaps.open('auth_rollback')
-        connection.start()
-        return { ok: true }
-      },
-      backup: () => backup().manifest
+        connection.clearOperatorBlock()
+        return capture.requestLink()
+      }
     }
   })
 
@@ -273,26 +386,34 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
   committer.tick() // replay anything journaled but not yet applied (crash recovery)
   gaps.onStartup()
   if (listen) await web.listen()
-  if (rollback.ok) connection.start()
-  else {
+  if (!rollback.ok) {
     connection.operatorBlocked(`${rollback.detail} Choose "Start fresh link" (wipes keys, needs a QR scan) or restore a consistent backup set.`)
+    ops.emit({ level: 'error', code: 'auth.rollback', message: rollback.detail })
     alerts.raise('needs_link', { title: 'Authentication store rollback detected', detail: rollback.detail })
   }
+  await capture.start()
   log.info({ port: config.port, host: config.host, epoch: ep.epoch, replay: counters.c.replay_backlog_at_start }, 'app: started')
 
   // ---- periodic tasks ----
+  let invariantsOk = true
   every(10_000, () => {
     gaps.beat()
-    if (authStore.writeCounter() >= Number(getMeta(msgDb, 'auth_counter_hwm') || 0) && connection.state().state !== 'NEEDS_OPERATOR') recordHighWater({ msgDb, authStore, journal })
+    if (authStore.writeCounter() >= Number(getMeta(msgDb, 'auth_counter_hwm') || 0) && connection.state().blocked?.reason !== 'operator') recordHighWater({ msgDb, authStore, journal })
   })
   every(15_000, () => {
     const d = diskFree()
-    if (d) setPressure('disk_low', d.free < Math.max(config.limits.diskMinFreeBytes, d.total * config.limits.diskMinFreeRatio))
-    if (d && d.free > Math.max(config.limits.diskMinFreeBytes, d.total * config.limits.diskMinFreeRatio) * 1.2) journal.ensureReserve()
-    setPressure('journal_backlog', committer.pendingApply() > config.limits.unappliedHighWater)
+    const floor = d ? Math.max(config.limits.diskMinFreeBytes, d.total * config.limits.diskMinFreeRatio) : 0
+    if (d) capture.setPressure('disk_low', d.free < floor, { free: d.free })
+    if (d && d.free > floor * 1.2) journal.ensureReserve()
+    capture.setPressure('journal_backlog', committer.pendingApply() > config.limits.unappliedHighWater)
     const h = health()
-    if (!h.invariants.ok) alerts.raise('invariant', { title: 'Ingestion counters do not reconcile', channels: ['email', 'whatsapp'], detail: JSON.stringify(h.invariants) })
-    else alerts.clear('invariant')
+    if (h.invariants.ok !== invariantsOk) {
+      invariantsOk = h.invariants.ok
+      if (!invariantsOk) {
+        ops.emit({ level: 'error', code: 'ingest.invariant', message: 'Ingestion counters do not reconcile — a message may have been lost in processing', context: h.invariants })
+        alerts.raise('invariant', { title: 'Ingestion counters do not reconcile', channels: ['email', 'whatsapp'], detail: JSON.stringify(h.invariants) })
+      } else alerts.clear('invariant')
+    }
     pushStatus()
   })
   every(60_000, () => {
@@ -302,17 +423,22 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
   every(3600_000, () => journal.prune(committer.appliedThrough(), config.journal.retainDays * 86400_000))
   let lastBackupDay = null
   every(60_000, () => {
-    const ist = new Date(Date.now() + 5.5 * 3600_000) // 03:30 IST daily
+    // nightly backup set at 03:30 IST (internal; no longer exposed as a button)
+    const ist = new Date(Date.now() + 5.5 * 3600_000)
     const day = ist.toISOString().slice(0, 10)
     if (ist.getUTCHours() === 3 && ist.getUTCMinutes() >= 30 && lastBackupDay !== day) {
       lastBackupDay = day
-      try { backup() } catch (err) { alerts.raise('backup', { title: 'Nightly backup failed', detail: err.message, severity: 'warning' }) }
+      try { backup() } catch (err) {
+        ops.emit({ level: 'error', code: 'backup.failed', message: `Nightly backup failed: ${err.message}` })
+        alerts.raise('backup', { title: 'Nightly backup failed', detail: err.message, severity: 'warning' })
+      }
     }
   })
 
   const shutdown = async () => {
     timers.forEach(clearInterval)
-    clearTimeout(offlineTimer)
+    clearTimeout(outageTimer)
+    await capture.stop()
     await connection.stop()
     closed = true
     clearTimeout(statusTimer)
@@ -329,5 +455,5 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     authDb.close()
   }
 
-  return { config, msgDb, authDb, journal, counters, intake, committer, groups, sessions, gaps, connection, alerts, web, bus, authStore, getStatus, getDiagnostics, shutdown, backup }
+  return { config, msgDb, authDb, journal, counters, intake, committer, groups, sessions, gaps, connection, capture, alerts, ops, web, bus, authStore, getStatus, getKpis, getDiagnostics, shutdown, backup }
 }

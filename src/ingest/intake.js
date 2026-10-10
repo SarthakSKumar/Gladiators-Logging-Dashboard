@@ -7,29 +7,27 @@ import { normalize } from '../wa/normalize.js'
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const MESSAGE_PATHS = ['messages.upsert', 'messaging-history.set']
 
-export const createIntake = ({ journal, groups, counters, limits, log, onDurable, onPressure, onMetadata, now = Date.now }) => {
+export const createIntake = ({ journal, groups, counters, limits, log, onDurable, onPressure, onMetadata, onUndecryptable, now = Date.now }) => {
   const c = counters.c
   const queue = [] // [{ events, at, records }]
   let queuedRecords = 0
   let running = false
-  let pressured = false
   let idleWaiters = []
+  let peakRecords = 0
 
   const countRecords = events =>
     (events['messages.upsert']?.messages.length || 0) + (events['messaging-history.set']?.messages.length || 0)
 
-  const setPressure = on => {
-    if (on === pressured) return
-    pressured = on
-    onPressure?.(on, 'intake_queue', { batches: queue.length, records: queuedRecords })
-  }
-
-  /** Called from sock.ev.process — must be synchronous and cheap. */
+  /**
+   * Called from sock.ev.process — must be synchronous and cheap. The queue only holds events Baileys has
+   * already received (and acknowledged), so disconnecting cannot shrink it; it is not a backpressure
+   * trigger (that is what suspended the socket mid-sync before). Its depth is reported as a gauge.
+   */
   const enqueue = events => {
     const records = countRecords(events)
     queue.push({ events, at: now(), records })
     queuedRecords += records
-    if (queue.length > limits.intakeMaxBatches || queuedRecords > limits.intakeMaxRecords) setPressure(true)
+    if (queuedRecords > peakRecords) peakRecords = queuedRecords
     if (!running) run()
   }
 
@@ -44,7 +42,6 @@ export const createIntake = ({ journal, groups, counters, limits, log, onDurable
           // breaks invariant I1, which raises an alert
           log.fatal({ err: err.stack }, 'intake: batch processing crashed')
         }
-        if (queue.length <= limits.intakeMaxBatches / 2 && queuedRecords <= limits.intakeMaxRecords / 2) setPressure(false)
         await new Promise(setImmediate) // keep the event loop responsive during bursts
       }
     } finally {
@@ -77,7 +74,12 @@ export const createIntake = ({ journal, groups, counters, limits, log, onDurable
           log.error({ err: err.message, chat }, 'intake: unstorable message')
           continue
         }
-        if (rec.kind === 'excluded_type') { c.excluded_type++; continue }
+        if (rec.kind === 'ignored') { c.excluded_type++; continue } // non-text: silently ignored by design
+        if (rec.kind === 'undecryptable') {
+          c.undecryptable++
+          if (scope === 'target') onUndecryptable?.(rec)
+          continue
+        }
         c.inflight++
         inScope.push(rec)
       }
@@ -102,10 +104,6 @@ export const createIntake = ({ journal, groups, counters, limits, log, onDurable
 
   const toJournalRecord = rec => {
     const received_at = now()
-    if (rec.kind === 'event') {
-      const { kind, ...rest } = rec
-      return { t: 'evt', ...rest, event_ts: rest.event_ts ?? received_at, received_at }
-    }
     const { kind, ...rest } = rec
     const wa = rest.wa_timestamp ?? received_at
     const skew = rest.source === 'live' && Math.abs(wa - received_at) > 60_000 ? 1 : 0
@@ -139,7 +137,7 @@ export const createIntake = ({ journal, groups, counters, limits, log, onDurable
 
   return {
     enqueue,
-    depth: () => ({ batches: queue.length, records: queuedRecords }),
+    depth: () => ({ batches: queue.length, records: queuedRecords, peakRecords }),
     /** resolves once everything enqueued so far is durable (used by shutdown and tests) */
     idle: () => (running || queue.length ? new Promise(r => idleWaiters.push(r)) : Promise.resolve())
   }

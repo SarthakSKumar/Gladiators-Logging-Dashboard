@@ -6,7 +6,8 @@ export const createCounters = () => {
     observed: 0,
     excluded_non_group: 0,
     excluded_non_target_group: 0,
-    excluded_type: 0,
+    excluded_type: 0, // non-text (media, stickers, polls, reactions, protocol…) — ignored by design, not a failure
+    undecryptable: 0, // in an observed group but WhatsApp could not decrypt it — reported as an operator event
     journaled: 0,
     inflight: 0, // gauge: classified in-scope, not yet durable (at risk)
     failed_not_durable: 0,
@@ -46,7 +47,7 @@ export const createCounters = () => {
     },
     /** gauges come from the live system: pending_apply = durable - applied, pending_scope_open = rows */
     check ({ pending_apply, pending_scope_open }) {
-      const i1 = c.observed === c.excluded_non_group + c.excluded_non_target_group + c.excluded_type + c.journaled + c.inflight + c.failed_not_durable
+      const i1 = c.observed === c.excluded_non_group + c.excluded_non_target_group + c.excluded_type + c.undecryptable + c.journaled + c.inflight + c.failed_not_durable
       const i2 = c.journaled + c.replay_backlog_at_start === c.applied_new + c.applied_duplicate + c.to_pending_scope + pending_apply
       const i3 = c.to_pending_scope + c.pending_scope_open_at_start === c.promoted_from_scope + c.purged_non_target + pending_scope_open
       return { ok: i1 && i2 && i3, i1, i2, i3 }

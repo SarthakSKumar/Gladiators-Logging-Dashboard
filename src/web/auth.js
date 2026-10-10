@@ -8,7 +8,7 @@ const httpError = (status, message) => Object.assign(new Error(message), { statu
 const sha256 = s => createHash('sha256').update(s).digest('hex')
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
-export const createWebAuth = ({ db, loadAdmins, mailer, secret, sessionTtlMs, log, now = Date.now }) => {
+export const createWebAuth = ({ db, loadAdmins, mailer, secret, sessionTtlMs, log, devOtpToConsole = false, now = Date.now }) => {
   const hits = new Map()
   /** sliding-window limiter: at most `max` events per `windowMs` for `key` */
   const allow = (key, max, windowMs) => {
@@ -31,11 +31,17 @@ export const createWebAuth = ({ db, loadAdmins, mailer, secret, sessionTtlMs, lo
     if (!admin) { audit(email, 'otp_denied', ip); throw httpError(403, 'This email is not authorised to sign in.') }
     if (!allow(`email-min:${email}`, 1, 60_000)) throw httpError(429, 'A code was just sent. Wait a minute before requesting another.')
     if (!allow(`email-hour:${email}`, 5, 3600_000)) throw httpError(429, 'Too many codes requested for this email. Try again in an hour.')
-    if (!mailer.configured) throw httpError(503, 'Email sending is not configured on the server (SMTP_USER / SMTP_PASS).')
+    if (!mailer.configured && !devOtpToConsole) throw httpError(503, 'Email sending is not configured on the server (SMTP_USER / SMTP_PASS).')
     const code = String(randomInt(0, 1_000_000)).padStart(6, '0')
     db.prepare(`INSERT INTO otps (email, code_hash, expires_at, attempts, created_at) VALUES (?, ?, ?, 0, ?)
       ON CONFLICT(email) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at, attempts = 0, created_at = excluded.created_at`)
       .run(email, hmac(email, code).toString('hex'), now() + OTP_TTL_MS, now())
+    if (!mailer.configured) {
+      // development only (no SMTP, NODE_ENV != production): print the code instead of emailing it
+      console.log(`[dev] Sign-in code for ${email}: ${code}  (valid 10 minutes)`)
+      audit(email, 'otp_console', ip)
+      return
+    }
     try {
       await mailer.send({
         to: email,

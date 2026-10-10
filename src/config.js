@@ -45,25 +45,14 @@ export const config = {
   pendingScopeTtlMs: 24 * 3600 * 1000
 }
 config.cookieSecure = env.COOKIE_SECURE ? env.COOKIE_SECURE === 'true' : config.publicOrigin.startsWith('https://')
+// Without SMTP, outside production, OTP codes are printed to the server console instead of emailed.
+config.devOtpToConsole = !(config.smtp.user && config.smtp.pass) && env.NODE_ENV !== 'production'
 
 const readJson = (file, fallback) => {
   try { return JSON.parse(readFileSync(join(config.configDir, file), 'utf8')) } catch (err) {
     if (err.code === 'ENOENT' && fallback !== undefined) return fallback
     throw new Error(`config/${file}: ${err.message}`)
   }
-}
-
-/** [{ key, label, jid? }] — re-read on every call so "Reload config" needs no restart */
-export const loadGroupsConfig = () => {
-  const groups = readJson('groups.json')
-  const keys = new Set()
-  for (const g of groups) {
-    if (!g.key || !g.label) throw new Error('config/groups.json: every entry needs "key" and "label"')
-    if (keys.has(g.key)) throw new Error(`config/groups.json: duplicate key ${g.key}`)
-    if (g.jid && !g.jid.endsWith('@g.us')) throw new Error(`config/groups.json: ${g.key} jid must end with @g.us`)
-    keys.add(g.key)
-  }
-  return groups
 }
 
 /** [{ name, email, phone, alerts }] — login allow-list and alert recipients */
