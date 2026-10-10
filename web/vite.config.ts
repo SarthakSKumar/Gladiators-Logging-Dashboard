@@ -10,7 +10,7 @@ export default defineConfig({
   resolve: { alias: { '@': path.resolve(import.meta.dirname, 'src') } },
   server: {
     port: 5173,
-    proxy: { '/api': { target: 'http://127.0.0.1:3000', changeOrigin: false } }
+    proxy: { '/api': { target: 'http://0.0.0.0:3000', changeOrigin: false } }
   },
   build: { outDir: 'dist', emptyOutDir: true, chunkSizeWarningLimit: 900 }
 })
