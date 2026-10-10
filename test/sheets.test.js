@@ -104,3 +104,22 @@ test("a session without a race number is not sent (skipped + one warning); pendi
   assert.equal(t.calls.at(-1).body.raceNumber, "5");
   t.p.close();
 });
+
+test("enabling forwarding mid-session back-fills that running session once (ended sessions are not)", async () => {
+  const t = await setup();
+  t.startSession(1, 1_790_000_000_000, 1_790_000_050_000); // ended before forwarding existed
+  t.startSession(2, 1_790_000_100_000); // still running
+  t.p.db.prepare("DELETE FROM meta WHERE key = 'sheets_cursor'").run();
+  await t.ingest([msg({ id: "OLD", ts: 1_790_000_010, text: "old" }), msg({ id: "R1", ts: 1_790_000_110, text: "Hi" }), msg({ id: "R2", ts: 1_790_000_120, text: "Ye" })]);
+  // first start of the integration: cursor = latest message, then the running session is back-filled
+  t.p.db.prepare("DELETE FROM sheet_outbox").run();
+  t.p.db.prepare("DELETE FROM meta WHERE key = 'sheets_cursor'").run();
+  const fresh = t.make();
+  await t.settle(fresh);
+  assert.deepEqual(t.calls.slice(-2).map((c) => [c.body.id, c.body.message, c.body.raceNumber]), [[1, "Hi", "2"], [2, "Ye", "2"]]);
+  assert.ok(!t.calls.some((c) => c.body.message === "old"), "ended session not back-filled");
+  const again = t.make(); // a later restart does not re-queue
+  await t.settle(again);
+  assert.equal(t.p.db.prepare("SELECT count(*) FROM sheet_outbox").pluck().get(), 2);
+  t.p.close();
+});

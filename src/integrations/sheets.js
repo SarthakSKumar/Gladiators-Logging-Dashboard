@@ -59,6 +59,23 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
 
   const senderName = m => m.push_name || m.contact_name || (m.sender_pn ? `+${m.sender_pn.split('@')[0]}` : m.sender_jid?.split('@')[0] || 'Unknown')
 
+  /** One outbox row for message m of target, in session s (idempotent: UNIQUE(message_seq)). */
+  const enqueueMessage = (m, target, s, noRace) => {
+    const rowId = nextRow.get(s.id)
+    const payload = {
+      id: rowId,
+      sender: senderName(m),
+      message: m.body,
+      groupName: target.groupName,
+      timestamp: m.wa_timestamp,
+      raceNumber: s.race_number == null ? null : String(s.race_number)
+    }
+    const skip = s.race_number == null
+    if (skip) noRace.add(s.id)
+    return insert.run(m.seq, s.id, target.key, rowId, JSON.stringify(payload), skip ? 'skipped' : 'pending', now(),
+      skip ? 'Session has no race number — no RACE sheet to write to' : null, now()).changes
+  }
+
   /** Turn newly committed messages of the forwarded groups into outbox rows (one transaction per batch). */
   const enqueue = db.transaction(() => {
     let cursor = Number(getCursor.get() || 0)
@@ -72,25 +89,37 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
         if (!target) continue
         const s = sessionFor.get(m.group_id, m.wa_timestamp, m.wa_timestamp)
         if (!s) continue // not inside a logging session (should not happen: only session messages are stored)
-        const rowId = nextRow.get(s.id)
-        const payload = {
-          id: rowId,
-          sender: senderName(m),
-          message: m.body,
-          groupName: target.groupName,
-          timestamp: m.wa_timestamp,
-          raceNumber: s.race_number == null ? null : String(s.race_number)
-        }
-        const skip = s.race_number == null
-        if (skip) noRace.add(s.id)
-        added += insert.run(m.seq, s.id, target.key, rowId, JSON.stringify(payload), skip ? 'skipped' : 'pending', now(),
-          skip ? 'Session has no race number — no RACE sheet to write to' : null, now()).changes
+        added += enqueueMessage(m, target, s, noRace)
       }
       cursor = rows.at(-1).seq
     }
     setCursor.run(String(cursor))
     return { added, noRace: [...noRace] }
   })
+
+  // On start: messages already logged in a *running* session of a forwarded group but never queued (forwarding
+  // was enabled, or the group mapping changed, mid-session) are queued once, in arrival order. Ended sessions
+  // and older history are never back-filled.
+  const backfillActive = db.transaction(() => {
+    const jids = [...byJid.keys()]
+    if (!jids.length) return 0
+    const active = db.prepare(`SELECT s.*, g.jid FROM sessions s JOIN groups g ON g.id = s.group_id
+      WHERE s.ended_at IS NULL AND g.jid IN (${jids.map(() => '?').join(',')})`).all(...jids)
+    const unqueued = db.prepare(`SELECT m.seq, m.group_id, m.chat_jid, m.wa_timestamp, m.body, m.push_name, m.sender_pn, m.sender_jid,
+        c.push_name AS contact_name
+      FROM messages m LEFT JOIN contacts c ON c.jid = m.sender_jid
+      WHERE m.group_id = ? AND m.msg_type = 'text' AND m.wa_timestamp >= ? AND m.seq <= ?
+        AND NOT EXISTS (SELECT 1 FROM sheet_outbox o WHERE o.message_seq = m.seq) ORDER BY m.seq`)
+    const cursor = Number(getCursor.get() || 0)
+    let added = 0
+    const noRace = new Set()
+    for (const s of active) {
+      for (const m of unqueued.all(s.group_id, Math.floor(s.started_at / 1000) * 1000, cursor)) added += enqueueMessage(m, byJid.get(s.jid), s, noRace)
+    }
+    if (added) log.info({ added }, 'sheets: queued messages of running sessions that were logged before forwarding was enabled')
+    return added
+  })
+  backfillActive()
 
   const warnedNoRace = new Set()
   let pumping = false
