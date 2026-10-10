@@ -295,7 +295,9 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
       groupsLogging: loggingCount(),
       sessionsToday: q(`SELECT count(*) FROM sessions WHERE started_at >= ? AND ${sel}`, today),
       ingestionFailuresToday: ops.countSince('ingest.', today, 'error') + ops.countSince('ingest.', today, 'warn'),
-      gapsToday: q("SELECT count(*) FROM capture_gaps WHERE started_at >= ? AND cause NOT IN ('idle','not_linked','linking')", today),
+      // capture gaps today that overlapped a logging session (time with no group logging is not a gap that matters)
+      gapsToday: q(`SELECT count(*) FROM capture_gaps g WHERE coalesce(g.ended_at, ?) >= ? AND g.cause NOT IN ('idle','not_linked','linking')
+        AND EXISTS (SELECT 1 FROM sessions s WHERE s.started_at < coalesce(g.ended_at, ?) AND coalesce(s.ended_at, ?) > g.started_at)`, Date.now(), today, Date.now(), Date.now()),
       dayStart: today
     }
   }

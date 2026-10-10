@@ -17,7 +17,8 @@ export const createOpsEvents = ({ db, bus, log, now = Date.now }) => {
     const context_json = context ? JSON.stringify(context) : null
     let row
     try {
-      const prev = recent.get(code, message, ts - COALESCE_MS)
+      // coalesce repeated problems/noise; distinct info transitions (capture started/stopped…) stay separate
+      const prev = level !== 'info' || noise ? recent.get(code, message, ts - COALESCE_MS) : null
       if (prev) { bump.run(ts, context_json, prev.id); row = get.get(prev.id) } else {
         const { lastInsertRowid } = insert.run({ ts, level, code, message, context_json, noise: noise ? 1 : 0 })
         row = get.get(lastInsertRowid)

@@ -45,6 +45,12 @@ export const createGroups = ({ db, log, configDir, now = Date.now }) => {
   const refreshAccount = async fetchAll => {
     const fetched = Object.values(await fetchAll())
     const t = now()
+    if (!fetched.length && selected().some(g => g.jid)) {
+      // an empty answer while groups are selected is far more likely a WhatsApp hiccup than the account
+      // having left every group: don't mark them removed (membership changes still arrive as events)
+      log?.warn('groups: account group list came back empty; keeping current selection status')
+      return 0
+    }
     db.transaction(() => {
       const up = db.prepare(`INSERT INTO account_groups (jid, subject, size, creation, updated_at) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(jid) DO UPDATE SET subject = excluded.subject, size = excluded.size, creation = excluded.creation, updated_at = excluded.updated_at`)
