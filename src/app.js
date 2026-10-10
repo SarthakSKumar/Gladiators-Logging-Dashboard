@@ -68,7 +68,6 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
 
   const mailer = mailerOverride ?? createMailer({ smtp: config.smtp, log })
   const groups = createGroups({ db: msgDb, log, configDir: config.configDir })
-  groups.importLegacyConfig()
 
   // ---- status fan-out (debounced) ----
   let statusTimer = null
