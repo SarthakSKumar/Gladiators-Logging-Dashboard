@@ -1,0 +1,11 @@
+node_modules/
+data/
+backups/
+logs/
+.env
+config/admins.json
+# legacy (archived in ../server-legacy-backup-2026-10-10, removed at cutover)
+chrome/
+auth-data/
+.wwebjs_auth/
+spike/data/

@@ -1,0 +1,12 @@
+{
+  "name": "wa-logger-spike",
+  "private": true,
+  "type": "module",
+  "description": "Phase 0 isolated Baileys spike. Imports nothing from ../src.",
+  "scripts": { "record": "node record.js" },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "pino": "^9.0.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

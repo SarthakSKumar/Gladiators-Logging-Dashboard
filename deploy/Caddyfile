@@ -1,0 +1,9 @@
+# /etc/caddy/Caddyfile — replace logger.example.com with your domain.
+# No domain yet? Use <server-ip-with-dashes>.sslip.io (e.g. 203-0-113-7.sslip.io) — Caddy gets a real certificate for it.
+logger.example.com {
+	encode gzip
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	reverse_proxy 127.0.0.1:3000 {
+		flush_interval -1   # SSE: stream immediately
+	}
+}

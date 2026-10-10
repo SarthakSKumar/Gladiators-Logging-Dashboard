@@ -1,0 +1,31 @@
+# /etc/systemd/system/wa-logger.service
+[Unit]
+Description=WhatsApp group logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=walogger
+Group=walogger
+WorkingDirectory=/opt/wa-logger
+EnvironmentFile=/etc/wa-logger/env
+ExecStart=/usr/bin/node src/main.js
+Restart=always
+RestartSec=2
+# exit 2 = data files inconsistent (mixed installs / journal epoch): needs an operator, don't loop
+RestartPreventExitStatus=2
+TimeoutStopSec=30
+KillSignal=SIGTERM
+# hard memory cap: Baileys' internal buffering is outside our bounds (plan §4)
+MemoryMax=1500M
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/wa-logger/data /opt/wa-logger/backups
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+{
+  "name": "wa-group-logger",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Always-on WhatsApp group message logger (Baileys + SQLite + journal)",
+  "main": "src/main.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/main.js",
+    "dev": "node --env-file-if-exists=.env --watch-path=src --watch-path=config src/main.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "restore": "node scripts/restore.js",
+    "break-glass": "node scripts/break-glass-session.js"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "better-sqlite3": "^12.4.1",
+    "express": "^5.1.0",
+    "nodemailer": "^7.0.6",
+    "pino": "^9.14.0",
+    "qrcode": "^1.5.4"
+  }
+}
