@@ -39,9 +39,10 @@ const SHEET: Record<string, { label: string; className: string }> = {
 }
 
 function SheetCell({ m }: { m: MessageRow }) {
-  const s = m.sheet_status ? SHEET[m.sheet_status] : null
+  const unread = m.sheet_status === "sent" && Boolean(m.sheet_error)
+  const s = unread ? { label: "Sent · not read", className: "text-warning-ink" } : m.sheet_status ? SHEET[m.sheet_status] : null
   if (!s) return <span className="text-muted-foreground">—</span>
-  const tip = m.sheet_status === "sent" ? `Written to row ${m.sheet_row! + 2} (S.No ${m.sheet_row})` : m.sheet_error || s.label
+  const tip = unread ? `${m.sheet_error} (row ${m.sheet_row! + 2})` : m.sheet_status === "sent" ? `Written to row ${m.sheet_row! + 2} (S.No ${m.sheet_row})` : m.sheet_error || s.label
   return (
     <span className={s.className} title={tip}>
       {s.label}

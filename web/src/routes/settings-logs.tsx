@@ -280,7 +280,7 @@ function SheetCallLog() {
             </TableHeader>
             <TableBody>
               {rows.flatMap((c) => {
-                const r = CALL_RESULT[c.result]
+                const r = c.result === "sent" && c.error ? { label: "Sent · not read", tone: "warn" as const } : CALL_RESULT[c.result]
                 const expanded = open === c.id
                 const toggle = () => setOpen(expanded ? null : c.id)
                 const main = (

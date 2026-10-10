@@ -209,3 +209,23 @@ test("call log: every attempt is stored with the exact request and the script's 
   assert.deepEqual(again.map((c) => [c.attempt, c.result]).reverse(), [[1, "rejected"], [2, "sent"]]);
   t.p.close();
 });
+
+test("script says parsed:false → the sheet row counts as sent, but is flagged 'not read' in the call log and history", async () => {
+  const t = await setup();
+  t.startSession(2, 1_790_000_000_000);
+  t.setReply(() => ({ status: 200, body: { status: "success", message: "Bet logged at row 3 (ID: 1) [NOT PARSED: no win/place amount found]", parsed: false, reason: "no win/place amount found", source: "none" } }));
+  await t.ingest([msg({ id: "A", ts: 1_790_000_010, text: "1 win" })]);
+  await t.settle();
+  const [call] = t.sheets.calls();
+  assert.equal(call.result, "sent");
+  assert.match(call.error, /could not read horse\/win\/place: no win\/place amount found/);
+  assert.equal(t.sheets.calls({ result: "problem" }).length, 1, "shows up under Problems");
+  assert.equal(t.sheets.stats()[0].sent, 1);
+  assert.match(t.p.db.prepare("SELECT last_error FROM sheet_outbox").pluck().get(), /could not read/);
+  // a normally parsed reply carries no note
+  t.setReply(() => ({ status: 200, body: { status: "success", message: "ok", parsed: true, source: "rules" } }));
+  await t.ingest([msg({ id: "B", ts: 1_790_000_020, text: "1w100" })]);
+  await t.settle();
+  assert.equal(t.sheets.calls()[0].error, null);
+  t.p.close();
+});

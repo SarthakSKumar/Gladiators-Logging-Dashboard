@@ -56,7 +56,8 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
   const insert = db.prepare(`INSERT OR IGNORE INTO sheet_outbox (message_seq, session_id, target, row_id, payload_json, status, next_attempt_at, last_error, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
   const nextDue = db.prepare("SELECT * FROM sheet_outbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT 1")
-  const markSent = db.prepare("UPDATE sheet_outbox SET status = 'sent', attempts = attempts + 1, sent_at = ?, response = ?, last_error = NULL WHERE id = ?")
+  // last_error on a SENT row carries a note when the sheet row was written but the script could not read the bet
+  const markSent = db.prepare("UPDATE sheet_outbox SET status = 'sent', attempts = attempts + 1, sent_at = ?, response = ?, last_error = ? WHERE id = ?")
   const markRetry = db.prepare('UPDATE sheet_outbox SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, response = ? WHERE id = ?')
   const markFailed = db.prepare("UPDATE sheet_outbox SET status = 'failed', attempts = attempts + 1, last_error = ?, response = ? WHERE id = ?")
   const insertCall = db.prepare(`INSERT INTO sheet_calls (ts, outbox_id, target, session_id, row_id, attempt, request, http_status, redirected, host, duration_ms, result, error, response)
@@ -178,9 +179,11 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
       const seen = { ...ctx, httpStatus: res.status, redirected: Boolean(res.redirected), host, ms, response: text.slice(0, 300) }
 
       if (res.ok && body?.status === 'success') {
-        log.info({ ...seen, result: 'sent' }, 'sheets: response')
-        record('sent')
-        return markSent.run(now(), text, row.id)
+        // the script answers "success" once the row is written; parsed:false means it could not read horse/win/place
+        const note = body.parsed === false ? `Row written, but the script could not read horse/win/place${body.reason ? `: ${body.reason}` : ''}` : null
+        log[note ? 'warn' : 'info']({ ...seen, result: note ? 'sent, bet not read' : 'sent', parsed: body.parsed, source: body.source }, 'sheets: response')
+        record('sent', note)
+        return markSent.run(now(), text, note, row.id)
       }
       let reason = body?.message || `HTTP ${res.status}${body ? '' : ' (response was not JSON)'}`
       // the script rejecting our group name is a configuration problem: retrying cannot fix it
@@ -259,7 +262,7 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
       const params = []
       if (beforeId) { where.push('c.id < ?'); params.push(beforeId) }
       if (result === 'sent') where.push("c.result = 'sent'")
-      else if (result === 'problem') where.push("c.result != 'sent'")
+      else if (result === 'problem') where.push("(c.result != 'sent' OR c.error IS NOT NULL)")
       if (target) { where.push('c.target = ?'); params.push(target) }
       const rows = db.prepare(`SELECT c.*, m.body AS message FROM sheet_calls c
         LEFT JOIN sheet_outbox o ON o.id = c.outbox_id LEFT JOIN messages m ON m.seq = o.message_seq

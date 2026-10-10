@@ -73,7 +73,7 @@ data/         messages.db · auth.db · journal/          (keep all three on ONE
 ```bash
 pnpm install
 pnpm build:web     # installs web/ deps and builds the dashboard into web/dist
-pnpm test          # 42 server tests: crash harness, burst, duplicates, capture state machine, races, text filter, e2e
+pnpm test          # server tests: crash harness, burst, duplicates, capture state machine, races, text filter, e2e
 pnpm start         # server + built dashboard on http://localhost:3000
 ```
 
@@ -127,6 +127,19 @@ endpoint in the same format the Android app used:
 - Delivery is durable (outbox table `sheet_outbox`): retried with backoff, resumed after restarts, failures shown in
   *Settings → Logs → Google Sheets* (with *Retry failed*) and as toasts. Messages logged before the integration was
   enabled are not back-filled.
+
+### The Apps Script (`appscript/Code.gs`)
+
+Deploy this file as the web app that the endpoint URL points to (*Deploy → Manage deployments → Edit → New
+version* keeps the same `/exec` URL). It reads each bet with **deterministic rules first** (`2w200`, `3p1kw5k`,
+`4 ew 100`, `9 each way 3k`, `10w100 10plc100`, …) and only asks Cloudflare Workers AI for messages the rules cannot
+read. Rows it cannot read keep Horse/Win/Place **empty**, get a red message cell with a note, and the reply carries
+`"parsed": false`, which the dashboard shows as *Sent · not read*. Several bets in one message are never guessed.
+
+- AI fallback is optional: set script properties `CF_API_TOKEN` and `CF_ACCOUNT_ID` (never put the token in the
+  code). Run `checkSetup()` and `runSelfTest()` from the Apps Script editor after deploying.
+- Tested: `test/appscript.test.js` runs the real file in a sandbox with a mocked Google environment, including
+  the AI reply shapes, hallucination checks and formula-injection protection.
 
 ## API (changed in v2.1)
 
