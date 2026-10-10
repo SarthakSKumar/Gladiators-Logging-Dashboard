@@ -116,3 +116,5 @@ already established from the pinned source are listed there.
 
 The previous whatsapp-web.js bot (`index.js`, `chrome/`, `auth-data/`, `.wwebjs_auth/`) is archived with checksums in
 `../server-legacy-backup-2026-10-10/` and will be deleted only after this replacement passes validation (cutover).
+# Gladiators-Logging-Dashboard
+# Gladiators-Logging-Dashboard
