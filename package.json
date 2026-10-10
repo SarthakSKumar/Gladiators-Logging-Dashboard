@@ -13,7 +13,9 @@
     "dev": "node --env-file-if-exists=.env --watch-path=src --watch-path=config src/main.js",
     "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
     "restore": "node scripts/restore.js",
-    "break-glass": "node scripts/break-glass-session.js"
+    "break-glass": "node scripts/break-glass-session.js",
+    "build:web": "pnpm --dir web install --frozen-lockfile && pnpm --dir web build",
+    "dev:web": "pnpm --dir web dev"
   },
   "dependencies": {
     "baileys": "7.0.0-rc14",
