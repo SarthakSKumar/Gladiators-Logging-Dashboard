@@ -124,6 +124,28 @@ export interface SheetsStatus {
   failures: { id: number; target: string; session_id: number; row_id: number; attempts: number; last_error: string; created_at: number; body: string; wa_timestamp: number }[]
 }
 
+export interface SheetCall {
+  id: number
+  ts: number
+  outbox_id: number
+  target: string
+  session_id: number
+  row_id: number
+  attempt: number
+  request: { id: number; sender: string; message: string; groupName: string; timestamp: number; raceNumber: string | null }
+  http_status: number | null
+  redirected: number
+  host: string | null
+  duration_ms: number | null
+  result: "sent" | "rejected" | "config_error" | "network_error"
+  error: string | null
+  response: string | null
+  message: string
+  sender: string
+  race: string | null
+  group: string
+}
+
 export interface MessagesPage {
   total: number
   rows: MessageRow[]

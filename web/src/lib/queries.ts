@@ -1,6 +1,6 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { api, del, post } from "./api"
-import type { AccountGroup, Diagnostics, Kpis, Me, MessagesPage, OpEvent, Session, SheetsStatus, Status } from "./types"
+import type { AccountGroup, Diagnostics, Kpis, Me, MessagesPage, OpEvent, Session, SheetCall, SheetsStatus, Status } from "./types"
 
 export const keys = {
   me: ["me"] as const,
@@ -83,9 +83,19 @@ export const useUnlink = () => {
 }
 export const useSheets = (enabled = true) =>
   useQuery({ queryKey: keys.sheets, queryFn: () => api<SheetsStatus>("/api/integrations/sheets"), enabled, refetchInterval: 5_000 })
+/** Every request made to the Apps Script endpoint, newest first, paged by id. */
+export const useSheetCalls = (result: "all" | "sent" | "problem") =>
+  useInfiniteQuery({
+    queryKey: ["sheet-calls", result],
+    initialPageParam: undefined as number | undefined,
+    queryFn: ({ pageParam }) =>
+      api<SheetCall[]>(`/api/integrations/sheets/calls?limit=100${pageParam ? `&beforeId=${pageParam}` : ""}${result === "all" ? "" : `&result=${result}`}`),
+    getNextPageParam: (last) => (last.length === 100 ? last.at(-1)!.id : undefined),
+    refetchInterval: 5_000,
+  })
 export const useRetrySheets = () => {
   const inv = useInvalidate()
-  return useMutation({ mutationFn: (target?: string) => post<{ requeued: number }>("/api/integrations/sheets/retry", { target }), onSuccess: () => inv(keys.sheets) })
+  return useMutation({ mutationFn: (target?: string) => post<{ requeued: number }>("/api/integrations/sheets/retry", { target }), onSuccess: () => inv(keys.sheets, ["sheet-calls"]) })
 }
 export const useSignOut = () =>
   useMutation({

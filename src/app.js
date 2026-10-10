@@ -390,6 +390,7 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
       },
       sheets: {
         status: () => ({ enabled: sheets.enabled, targets: sheets.stats(), failures: sheets.recentFailures() }),
+        calls: opts => sheets.calls(opts),
         retry: target => { const n = sheets.retryFailed(target); sheets.pump(); return { requeued: n } }
       },
       link: async () => {

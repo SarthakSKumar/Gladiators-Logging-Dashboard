@@ -54,8 +54,22 @@ const factory = opts => {
   return sock
 }
 
+// The Google Sheets forwarder NEVER touches the network here: a scripted stand-in for the Apps Script answers
+// (mostly success; a missing RACE sheet for race 9; an occasional network failure).
+let calls = 0
+const sheetsFetch = async (url, init) => {
+  const p = JSON.parse(init.body)
+  calls++
+  if (calls % 7 === 0) throw new Error('fetch failed')
+  const body = p.raceNumber === '9'
+    ? { status: 'error', message: 'Template Sheet not found!' }
+    : { status: 'success', message: `Bet logged at row ${p.id + 2} (ID: ${p.id}), Horse: ${(p.id % 9) + 1}, Win: ${(p.id % 5 + 1) * 100}, Place: 0` }
+  await new Promise(r => setTimeout(r, 150 + (calls % 5) * 220))
+  return { ok: true, status: 200, redirected: true, url: 'https://script.googleusercontent.com/macros/echo?user_content_key=harness', text: async () => JSON.stringify(body) }
+}
+
 app = await startApp({
-  config: { ...config, dataDir: join(dir, 'data'), backupDir: join(dir, 'backups'), port: Number(port), devOtpToConsole: true },
+  config: { ...config, dataDir: join(dir, 'data'), backupDir: join(dir, 'backups'), port: Number(port), devOtpToConsole: true, sheetsFetch },
   log, makeSocket: factory, getVersion: async () => undefined, mailer: { configured: false, send: async () => {} }
 })
 if (mode === 'unlinked') {

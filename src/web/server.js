@@ -103,6 +103,7 @@ export const createWebServer = (deps) => {
 
   // custom integration: Google Sheets forwarding (two Gladiators groups)
   app.get('/api/integrations/sheets', wrap(() => actions.sheets.status()))
+  app.get('/api/integrations/sheets/calls', wrap(req => actions.sheets.calls({ limit: int(req.query.limit) ?? 100, beforeId: int(req.query.beforeId), result: req.query.result, target: req.query.target })))
   app.post('/api/integrations/sheets/retry', wrap(req => actions.sheets.retry(req.body?.target)))
 
   // WhatsApp link lifecycle

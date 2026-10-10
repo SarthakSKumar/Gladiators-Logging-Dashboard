@@ -59,6 +59,8 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
   const markSent = db.prepare("UPDATE sheet_outbox SET status = 'sent', attempts = attempts + 1, sent_at = ?, response = ?, last_error = NULL WHERE id = ?")
   const markRetry = db.prepare('UPDATE sheet_outbox SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, response = ? WHERE id = ?')
   const markFailed = db.prepare("UPDATE sheet_outbox SET status = 'failed', attempts = attempts + 1, last_error = ?, response = ? WHERE id = ?")
+  const insertCall = db.prepare(`INSERT INTO sheet_calls (ts, outbox_id, target, session_id, row_id, attempt, request, http_status, redirected, host, duration_ms, result, error, response)
+    VALUES (@ts, @outbox_id, @target, @session_id, @row_id, @attempt, @request, @http_status, @redirected, @host, @duration_ms, @result, @error, @response)`)
 
   const senderName = m => m.push_name || m.contact_name || (m.sender_pn ? `+${m.sender_pn.split('@')[0]}` : m.sender_jid?.split('@')[0] || 'Unknown')
 
@@ -147,6 +149,17 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
     log.info({ ...ctx, url: maskUrl(target.url), payload }, 'sheets: POST')
     const t0 = Date.now()
     let text = ''
+    // what the call log stores; filled in as the exchange progresses
+    const seenCall = { http_status: null, redirected: 0, host: null }
+    /** Persist this attempt (request + the script's answer) in sheet_calls. Never throws. */
+    const record = (result, error = null) => {
+      try {
+        insertCall.run({
+          ts: now(), outbox_id: row.id, target: row.target, session_id: row.session_id, row_id: row.row_id, attempt: ctx.attempt,
+          request: row.payload_json, ...seenCall, duration_ms: Date.now() - t0, result, error, response: text || null
+        })
+      } catch (err) { log.warn({ err: err.message }, 'sheets: could not store call log entry') }
+    }
     try {
       const res = await fetchImpl(target.url, {
         method: 'POST',
@@ -161,26 +174,33 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
       try { body = JSON.parse(text) } catch { /* not JSON (e.g. an HTML error page) */ }
       let host = null
       try { host = res.url ? new URL(res.url).host : null } catch { /* mock responses have no url */ }
+      Object.assign(seenCall, { http_status: res.status, redirected: res.redirected ? 1 : 0, host })
       const seen = { ...ctx, httpStatus: res.status, redirected: Boolean(res.redirected), host, ms, response: text.slice(0, 300) }
 
       if (res.ok && body?.status === 'success') {
         log.info({ ...seen, result: 'sent' }, 'sheets: response')
+        record('sent')
         return markSent.run(now(), text, row.id)
       }
       let reason = body?.message || `HTTP ${res.status}${body ? '' : ' (response was not JSON)'}`
       // the script rejecting our group name is a configuration problem: retrying cannot fix it
       if (/unrecognized group name/i.test(reason)) {
         log.error({ ...seen, result: 'failed (group name rejected)' }, 'sheets: response')
+        record('config_error', reason)
         markFailed.run(reason, text, row.id)
         return ops.emit({ level: 'error', code: 'sheets.config', message: `Google Sheets rejected group "${payload.groupName}": ${reason}. Fix the Apps Script group mapping, then retry failed rows in Settings → Logs → Google Sheets.`, context: { target: row.target } })
       }
       // "Template Sheet not found!" is what the script says when the RACE <n> sheet does not exist
       if (/template sheet not found/i.test(reason)) reason = `The spreadsheet has no "RACE ${payload.raceNumber}" sheet (script said: ${reason})`
       log.warn({ ...seen, result: 'rejected' }, 'sheets: response')
+      record('rejected', reason)
       throw Object.assign(new Error(reason), { logged: true })
     } catch (err) {
       const reason = err.name === 'TimeoutError' ? `timed out after ${TIMEOUT_MS / 1000} s` : err.message
-      if (!err.logged) log.warn({ ...ctx, ms: Date.now() - t0, error: err.name, reason, cause: err.cause?.code || err.cause?.message }, 'sheets: request failed')
+      if (!err.logged) {
+        log.warn({ ...ctx, ms: Date.now() - t0, error: err.name, reason, cause: err.cause?.code || err.cause?.message }, 'sheets: request failed')
+        record('network_error', reason)
+      }
       if (row.attempts + 1 >= MAX_ATTEMPTS) {
         markFailed.run(reason, text || null, row.id)
         log.error({ ...ctx, reason }, 'sheets: giving up on this message')
@@ -233,6 +253,22 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
     tick,
     pump,
     targetFor: jid => byJid.get(jid) || null,
+    /** Call log, newest first. result: 'sent' | 'problem' (everything that is not sent) | undefined = all. */
+    calls: ({ limit = 100, beforeId, result, target } = {}) => {
+      const where = []
+      const params = []
+      if (beforeId) { where.push('c.id < ?'); params.push(beforeId) }
+      if (result === 'sent') where.push("c.result = 'sent'")
+      else if (result === 'problem') where.push("c.result != 'sent'")
+      if (target) { where.push('c.target = ?'); params.push(target) }
+      const rows = db.prepare(`SELECT c.*, m.body AS message FROM sheet_calls c
+        LEFT JOIN sheet_outbox o ON o.id = c.outbox_id LEFT JOIN messages m ON m.seq = o.message_seq
+        ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY c.id DESC LIMIT ?`).all(...params, Math.min(limit, 500))
+      return rows.map(r => {
+        const req = JSON.parse(r.request)
+        return { ...r, request: req, sender: req.sender, race: req.raceNumber, group: req.groupName, message: r.message ?? req.message }
+      })
+    },
     /** failed → pending again (optionally only one target) */
     retryFailed: target => db.prepare(`UPDATE sheet_outbox SET status = 'pending', attempts = 0, next_attempt_at = ?
       WHERE status = 'failed' ${target ? 'AND target = ?' : ''}`).run(...(target ? [now(), target] : [now()])).changes,

@@ -5,9 +5,10 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { bytes, elapsed, full, num, timeOfDay, when } from "@/lib/format"
 import { notifySuccess } from "@/lib/notify"
-import { useDiagnostics, useEvents, useRetrySheets, useSheets } from "@/lib/queries"
+import { useDiagnostics, useEvents, useRetrySheets, useSheetCalls, useSheets } from "@/lib/queries"
+import type { SheetCall } from "@/lib/types"
 import { Button } from "@/components/ui/button"
-import { RotateCw } from "lucide-react"
+import { ChevronRight, RotateCw } from "lucide-react"
 import type { Diagnostics, OpEvent } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -214,6 +215,150 @@ function ConnectionLog({ d, events }: { d: Diagnostics; events: OpEvent[] }) {
   )
 }
 
+const CALL_RESULT: Record<SheetCall["result"], { label: string; tone: "live" | "warn" | "error" }> = {
+  sent: { label: "Sent", tone: "live" },
+  rejected: { label: "Rejected", tone: "warn" },
+  config_error: { label: "Group rejected", tone: "error" },
+  network_error: { label: "No response", tone: "error" },
+}
+
+function pretty(json: string | null) {
+  if (!json) return "—"
+  try {
+    return JSON.stringify(JSON.parse(json), null, 2)
+  } catch {
+    return json
+  }
+}
+
+/** Every call made to the Apps Script endpoint: the request that was sent and what the script answered. */
+function SheetCallLog() {
+  const [filter, setFilter] = useState<"all" | "sent" | "problem">("all")
+  const [open, setOpen] = useState<number | null>(null)
+  const q = useSheetCalls(filter)
+  const rows = q.data?.pages.flat() ?? []
+  return (
+    <section className="grid gap-3" aria-labelledby="calls-heading">
+      <div className="flex flex-wrap items-center gap-3">
+        <h2 id="calls-heading" className="text-sm font-semibold">
+          Call log
+        </h2>
+        <Select value={filter} onValueChange={(v) => setFilter(v as typeof filter)}>
+          <SelectTrigger className="w-44" aria-label="Filter calls" size="sm">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All calls</SelectItem>
+            <SelectItem value="sent">Sent only</SelectItem>
+            <SelectItem value="problem">Problems only</SelectItem>
+          </SelectContent>
+        </Select>
+        <span className="text-xs text-muted-foreground">Every request to the Apps Script, with the script’s reply. Kept permanently.</span>
+      </div>
+      <div className="overflow-hidden rounded-xl border bg-background">
+        {q.isPending ? (
+          <Skeleton className="h-40 w-full" />
+        ) : q.isError ? (
+          <p className="px-4 py-6 text-sm text-danger">Couldn’t load the call log: {q.error.message}</p>
+        ) : rows.length === 0 ? (
+          <p className="px-4 py-10 text-center text-sm text-muted-foreground">
+            {filter === "all" ? "No calls yet. They appear here as messages are sent to Google Sheets." : "Nothing matches this filter."}
+          </p>
+        ) : (
+          <Table className="text-[13px]">
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead className="w-8" />
+                <TableHead className="w-28">Time</TableHead>
+                <TableHead>Group · RACE · S.No</TableHead>
+                <TableHead>Sender</TableHead>
+                <TableHead>Message</TableHead>
+                <TableHead>Result</TableHead>
+                <TableHead className="text-right">HTTP</TableHead>
+                <TableHead className="text-right">ms</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.flatMap((c) => {
+                const r = CALL_RESULT[c.result]
+                const expanded = open === c.id
+                const toggle = () => setOpen(expanded ? null : c.id)
+                const main = (
+                  <TableRow key={c.id} className="cursor-pointer align-top" onClick={toggle}>
+                    <TableCell>
+                      <button
+                        type="button"
+                        aria-expanded={expanded}
+                        aria-label={expanded ? "Hide details" : "Show details"}
+                        className="flex size-5 items-center justify-center rounded text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          toggle()
+                        }}
+                      >
+                        <ChevronRight className={cn("size-4 transition-transform", expanded && "rotate-90")} />
+                      </button>
+                    </TableCell>
+                    <TableCell className="tabular-nums" title={full(c.ts)}>
+                      {when(c.ts)}
+                    </TableCell>
+                    <TableCell>
+                      <span className="block max-w-52 truncate">{c.group}</span>
+                      <span className="text-xs text-muted-foreground tabular-nums">
+                        RACE {c.race ?? "?"} · #{c.row_id}
+                        {c.attempt > 1 ? ` · attempt ${c.attempt}` : ""}
+                      </span>
+                    </TableCell>
+                    <TableCell className="max-w-32 truncate">{c.sender}</TableCell>
+                    <TableCell className="max-w-56 truncate" title={c.message}>
+                      {c.message}
+                    </TableCell>
+                    <TableCell>
+                      <StatusPill tone={r.tone}>{r.label}</StatusPill>
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{c.http_status ?? "—"}</TableCell>
+                    <TableCell className="text-right tabular-nums">{c.duration_ms ?? "—"}</TableCell>
+                  </TableRow>
+                )
+                if (!expanded) return [main]
+                return [
+                  main,
+                  <TableRow key={`${c.id}-d`} className="bg-surface-2 hover:bg-surface-2">
+                    <TableCell />
+                    <TableCell colSpan={7}>
+                      <div className="grid gap-3 py-1 md:grid-cols-2">
+                        <div className="min-w-0">
+                          <p className="mb-1 text-xs font-medium text-muted-foreground">Request sent</p>
+                          <pre className="max-h-60 overflow-auto rounded-md border bg-background p-2 font-mono text-xs break-words whitespace-pre-wrap">{JSON.stringify(c.request, null, 2)}</pre>
+                        </div>
+                        <div className="min-w-0">
+                          <p className="mb-1 text-xs font-medium text-muted-foreground">
+                            Script’s reply{c.host ? ` · ${c.host}` : ""}
+                            {c.redirected ? " · after redirect" : ""}
+                          </p>
+                          <pre className="max-h-60 overflow-auto rounded-md border bg-background p-2 font-mono text-xs break-words whitespace-pre-wrap">{c.response ? pretty(c.response) : "No response received"}</pre>
+                          {c.error && <p className="mt-2 text-xs text-danger">{c.error}</p>}
+                        </div>
+                      </div>
+                    </TableCell>
+                  </TableRow>,
+                ]
+              })}
+            </TableBody>
+          </Table>
+        )}
+        {q.hasNextPage && (
+          <div className="flex justify-center border-t p-2">
+            <Button variant="ghost" size="sm" disabled={q.isFetchingNextPage} onClick={() => q.fetchNextPage()}>
+              Load older
+            </Button>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
 function SheetsLog() {
   const q = useSheets()
   const retry = useRetrySheets()
@@ -260,6 +405,7 @@ function SheetsLog() {
         </Button>
         <span className="text-xs text-muted-foreground">Each message keeps its row number, so a retry rewrites the same row instead of adding a duplicate.</span>
       </div>
+      <SheetCallLog />
       {q.data.failures.length > 0 && (
         <div className="overflow-hidden rounded-xl border bg-background">
           <Table>

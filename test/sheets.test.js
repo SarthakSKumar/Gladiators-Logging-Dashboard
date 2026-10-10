@@ -168,3 +168,44 @@ test("a missing RACE sheet is reported in plain words (script says 'Template She
   assert.match(t.sheets.stats()[0].lastError, /no "RACE 9" sheet/);
   t.p.close();
 });
+
+test("call log: every attempt is stored with the exact request and the script's answer (sent, rejected, network error)", async () => {
+  const t = await setup();
+  t.startSession(3, 1_790_000_000_000);
+  // 1) accepted
+  await t.ingest([msg({ id: "A", ts: 1_790_000_010, text: "7 win 1000", pushName: "Ravi" })]);
+  await t.settle();
+  // 2) the script says the RACE sheet is missing (retryable), 3) the network fails
+  t.setReply(() => ({ status: 200, body: { status: "error", message: "Template Sheet not found!" } }));
+  await t.ingest([msg({ id: "B", ts: 1_790_000_020, text: "2p200", pushName: "Imran" })]);
+  await t.settle();
+  t.setReply(() => new Error("fetch failed"));
+  await t.ingest([msg({ id: "C", ts: 1_790_000_030, text: "3w300", pushName: "Kiran" })]);
+  await t.settle();
+
+  const all = t.sheets.calls();
+  assert.deepEqual(all.map((c) => c.result).reverse(), ["sent", "rejected", "network_error"]);
+  const [net, rej, ok] = all;
+  assert.equal(ok.message, "7 win 1000");
+  assert.deepEqual([ok.sender, ok.race, ok.row_id, ok.http_status, ok.attempt], ["Ravi", "3", 1, 200, 1]);
+  assert.deepEqual(ok.request, JSON.parse(t.calls[0].init.body), "the stored request is exactly what was POSTed");
+  assert.match(ok.response, /Bet logged/);
+  assert.match(rej.error, /no "RACE 3" sheet/);
+  assert.match(rej.response, /Template Sheet not found/);
+  assert.equal(net.http_status, null);
+  assert.match(net.error, /fetch failed/);
+
+  // filters + paging
+  assert.equal(t.sheets.calls({ result: "sent" }).length, 1);
+  assert.equal(t.sheets.calls({ result: "problem" }).length, 2);
+  assert.equal(t.sheets.calls({ beforeId: rej.id }).length, 1);
+  assert.equal(t.sheets.calls({ target: "nope" }).length, 0);
+
+  // a retry of the same message is a second entry for the same row (history is kept, not overwritten)
+  t.setReply(() => ({ status: 200, body: { status: "success", message: "ok" } }));
+  t.advance(10 * 60_000);
+  await t.settle();
+  const again = t.sheets.calls().filter((c) => c.outbox_id === rej.outbox_id);
+  assert.deepEqual(again.map((c) => [c.attempt, c.result]).reverse(), [[1, "rejected"], [2, "sent"]]);
+  t.p.close();
+});
