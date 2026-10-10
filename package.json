@@ -15,7 +15,8 @@
     "restore": "node scripts/restore.js",
     "break-glass": "node scripts/break-glass-session.js",
     "build:web": "pnpm --dir web install --frozen-lockfile && pnpm --dir web build",
-    "dev:web": "pnpm --dir web dev"
+    "dev:web": "pnpm --dir web dev",
+    "setup": "pnpm install && pnpm build:web"
   },
   "dependencies": {
     "baileys": "7.0.0-rc14",
