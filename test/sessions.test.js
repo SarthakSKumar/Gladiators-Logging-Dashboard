@@ -60,3 +60,19 @@ test('adjacent sessions never double-claim a message; validation errors', async 
   assert.throws(() => sessions.start({ groupId: gid, label: 'x', raceNumber: 11 }), /1–10/)
   p.close()
 })
+
+test('session interruptions: only gaps that begin during a session count', async () => {
+  const p = makePipeline()
+  let clock = 1_790_000_000_000
+  const sessions = createSessions({ db: p.db, now: () => clock })
+  const gid = p.groups.targetOf(G1).id
+  const gap = (from, to, cause) => p.db.prepare("INSERT INTO capture_gaps (started_at, ended_at, cause, status) VALUES (?, ?, ?, 'unverified')").run(from, to, cause)
+  gap(clock - 5_000, clock + 3_000, 'connecting') // capture still coming up when the session started: expected
+  const s = sessions.start({ groupId: gid, label: 'R1' })
+  gap(clock + 60_000, clock + 90_000, 'interrupted') // disconnect mid-session: an interruption
+  clock += 120_000
+  sessions.stop({ id: s.id })
+  const st = sessions.stats(sessions.get(s.id))
+  assert.deepEqual(st.gaps.map(g => g.cause), ['interrupted'])
+  p.close()
+})

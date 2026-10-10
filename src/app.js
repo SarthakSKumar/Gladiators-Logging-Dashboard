@@ -88,9 +88,10 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
     db: msgDb, log,
     onClosed: g => {
       pushStatus()
-      // only gaps that overlapped a logging session matter to an operator (idle/server-off time does not)
-      const overlapped = msgDb.prepare('SELECT count(*) FROM sessions WHERE started_at < ? AND coalesce(ended_at, ?) > ?').pluck().get(g.ended_at, g.ended_at, g.started_at)
-      if (g.status === 'unverified' && overlapped && !['idle', 'not_linked', 'linking'].includes(g.cause)) {
+      // only an *interruption* matters: capture stopped while a session was already logging (a gap that
+      // merely precedes a session's start — capture coming up — is expected and not reported)
+      const interrupted = msgDb.prepare('SELECT count(*) FROM sessions WHERE started_at < ? AND coalesce(ended_at, ?) > ?').pluck().get(g.started_at, g.ended_at, g.started_at)
+      if (g.status === 'unverified' && interrupted && !['idle', 'not_linked', 'linking'].includes(g.cause)) {
         const detail = `Capture was not running from ${new Date(g.started_at).toISOString()} to ${new Date(g.ended_at).toISOString()} (${g.cause}) while a group was logging. WhatsApp gives no way to prove nothing was missed.`
         ops.emit({ level: 'warn', code: 'capture.gap_unverified', message: 'A capture gap could not be verified', context: { gapId: g.id, cause: g.cause, from: g.started_at, to: g.ended_at } })
         alerts.notify({ title: 'Capture gap could not be verified', channels: ['email', 'whatsapp'], detail })
@@ -220,13 +221,17 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
   const onCaptureMaybeChanged = () => {
     const cs = capture.captureState()
     if (cs.state === lastCapture) return
+    const prevCapture = lastCapture
     lastCapture = cs.state
     if (cs.state === 'capturing') {
       gaps.close()
       clearTimeout(outageTimer); outageTimer = null
       for (const k of ['not_online', 'capture_error']) alerts.clear(k)
     } else {
-      gaps.open({ idle: 'idle', not_linked: 'not_linked', linking: 'linking', starting: 'connecting', error: cs.reason || 'error' }[cs.state] || cs.state)
+      const wasCapturing = prevCapture === 'capturing'
+      gaps.open(cs.logging === 0 ? 'idle'
+        : wasCapturing && cs.state === 'starting' ? 'interrupted'
+          : ({ not_linked: 'not_linked', linking: 'linking', starting: 'connecting', error: cs.reason || 'error' }[cs.state] || cs.state))
       if (cs.logging > 0 && !outageTimer && ['starting', 'error'].includes(cs.state)) {
         outageTimer = setTimeout(() => {
           outageTimer = null
@@ -295,9 +300,9 @@ export const startApp = async ({ config, log, makeSocket, getVersion, mailer: ma
       groupsLogging: loggingCount(),
       sessionsToday: q(`SELECT count(*) FROM sessions WHERE started_at >= ? AND ${sel}`, today),
       ingestionFailuresToday: ops.countSince('ingest.', today, 'error') + ops.countSince('ingest.', today, 'warn'),
-      // capture gaps today that overlapped a logging session (time with no group logging is not a gap that matters)
+      // capture interruptions today: gaps that began while a session was already logging
       gapsToday: q(`SELECT count(*) FROM capture_gaps g WHERE coalesce(g.ended_at, ?) >= ? AND g.cause NOT IN ('idle','not_linked','linking')
-        AND EXISTS (SELECT 1 FROM sessions s WHERE s.started_at < coalesce(g.ended_at, ?) AND coalesce(s.ended_at, ?) > g.started_at)`, Date.now(), today, Date.now(), Date.now()),
+        AND EXISTS (SELECT 1 FROM sessions s WHERE s.started_at < g.started_at AND coalesce(s.ended_at, ?) > g.started_at)`, Date.now(), today, Date.now()),
       dayStart: today
     }
   }
