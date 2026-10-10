@@ -1,5 +1,5 @@
 allowBuilds:
   better-sqlite3: true
-  # reviewed: preinstall engine check / protobuf version notice only — not needed
+  # reviewed: preinstall engine check / protobuf version notice only not needed
   baileys: false
   protobufjs: false
