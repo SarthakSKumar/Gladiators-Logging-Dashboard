@@ -18,7 +18,9 @@ const setup = async () => {
   };
   const events = [];
   const ops = { emit: (e) => events.push(e) };
-  const make = () => createSheetsForwarder({ db: p.db, targets: TARGETS, ops, log: silent, fetchImpl, now: () => clock });
+  const logs = [];
+  const log = Object.fromEntries(["info", "warn", "error"].map((l) => [l, (o, m) => logs.push({ l, m, ...o })]));
+  const make = () => createSheetsForwarder({ db: p.db, targets: TARGETS, ops, log, fetchImpl, now: () => clock, sendIntervalMs: 0 });
   const sheets = make();
   const gid = p.groups.targetOf(G1).id;
   const startSession = (race, from, to = null) =>
@@ -29,7 +31,7 @@ const setup = async () => {
     p.committer.tick();
   };
   const settle = async (s = sheets) => { s.tick(); await new Promise((r) => setTimeout(r, 20)); await s.pump(); };
-  return { p, calls, events, sheets, make, startSession, ingest, settle, setReply: (f) => (reply = f), advance: (ms) => (clock += ms) };
+  return { p, calls, events, logs, sheets, make, startSession, ingest, settle, setReply: (f) => (reply = f), advance: (ms) => (clock += ms) };
 };
 
 test("payload matches the Android app; id is 1, 2, 3… per session; raceNumber picks the sheet", async () => {
@@ -121,5 +123,48 @@ test("enabling forwarding mid-session back-fills that running session once (ende
   const again = t.make(); // a later restart does not re-queue
   await t.settle(again);
   assert.equal(t.p.db.prepare("SELECT count(*) FROM sheet_outbox").pluck().get(), 2);
+  t.p.close();
+});
+
+test("every call to the endpoint is logged: request payload, response, outcome (and the URL is masked)", async () => {
+  const t = await setup();
+  t.startSession(3, 1_790_000_000_000);
+  await t.ingest([msg({ id: "A", ts: 1_790_000_010, text: "5 w 100", pushName: "Ravi" })]);
+  await t.settle();
+  let post = t.logs.find((x) => x.m === "sheets: POST");
+  assert.equal(post.payload.message, "5 w 100");
+  assert.equal(post.payload.raceNumber, "3");
+  assert.equal(post.attempt, 1);
+  assert.ok(post.url.startsWith("https://script.google.com/macros/s/TEST"), "script id never logged in full");
+  const ok = t.logs.find((x) => x.m === "sheets: response");
+  assert.deepEqual([ok.result, ok.httpStatus], ["sent", 200]);
+  assert.match(ok.response, /Bet logged/);
+
+  // the script rejects the group name → error-level line with the script's answer
+  t.logs.length = 0;
+  t.setReply(() => ({ status: 200, body: { status: "error", message: "Unrecognized group name: 'x'" } }));
+  await t.ingest([msg({ id: "B", ts: 1_790_000_020, text: "2p200" })]);
+  await t.settle();
+  const rej = t.logs.find((x) => x.m === "sheets: response");
+  assert.equal(rej.l, "error");
+  assert.match(rej.response, /Unrecognized group name/);
+
+  // network failure → warn line with the reason, then a retry line
+  t.logs.length = 0;
+  t.setReply(() => new Error("fetch failed"));
+  await t.ingest([msg({ id: "C", ts: 1_790_000_030, text: "3w300" })]);
+  await t.settle();
+  assert.ok(t.logs.some((x) => x.m === "sheets: request failed" && /fetch failed/.test(x.reason)));
+  assert.ok(t.logs.some((x) => x.m === "sheets: will retry" && x.retryInSeconds > 0));
+  t.p.close();
+});
+
+test("a missing RACE sheet is reported in plain words (script says 'Template Sheet not found!')", async () => {
+  const t = await setup();
+  t.startSession(9, 1_790_000_000_000);
+  t.setReply(() => ({ status: 200, body: { status: "error", message: "Template Sheet not found!" } }));
+  await t.ingest([msg({ id: "A", ts: 1_790_000_010, text: "1w100" })]);
+  await t.settle();
+  assert.match(t.sheets.stats()[0].lastError, /no "RACE 9" sheet/);
   t.p.close();
 });

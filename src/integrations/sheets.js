@@ -17,9 +17,10 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const BATCH = 200
-const CONCURRENCY = 4
+const SEND_INTERVAL_MS = 1_000 // minimum gap between requests so the Apps Script endpoint is never hit in bursts
 const MAX_ATTEMPTS = 8
 const TIMEOUT_MS = 45_000
+const sleep = ms => new Promise(r => setTimeout(r, ms))
 const backoffMs = attempts => Math.min(60 * 60_000, 5_000 * 2 ** Math.max(0, attempts - 1))
 
 /** config/sheets.json: { "targets": [{ "key", "groupJid", "groupName", "url" }] } (missing file = disabled) */
@@ -35,9 +36,11 @@ export const loadSheetsConfig = configDir => {
   return targets
 }
 
-export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globalThis.fetch, now = Date.now }) => {
+export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globalThis.fetch, now = Date.now, sendIntervalMs = SEND_INTERVAL_MS }) => {
   const byJid = new Map(targets.map(t => [t.groupJid, t]))
   const byKey = new Map(targets.map(t => [t.key, t]))
+  // Script ids are part of the endpoint's access, so logs only ever show a masked URL.
+  const maskUrl = u => String(u).replace(/\/s\/([^/]{6})[^/]*/, '/s/$1…').replace(/user_content_key=[^&]*/, 'user_content_key=…')
   const getCursor = db.prepare("SELECT value FROM meta WHERE key = 'sheets_cursor'").pluck()
   const setCursor = db.prepare("INSERT INTO meta (key, value) VALUES ('sheets_cursor', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
   // never back-fill history that was logged before this integration existed
@@ -52,7 +55,7 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
   const nextRow = db.prepare('SELECT coalesce(max(row_id), 0) + 1 FROM sheet_outbox WHERE session_id = ?').pluck()
   const insert = db.prepare(`INSERT OR IGNORE INTO sheet_outbox (message_seq, session_id, target, row_id, payload_json, status, next_attempt_at, last_error, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-  const due = db.prepare("SELECT * FROM sheet_outbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT ?")
+  const nextDue = db.prepare("SELECT * FROM sheet_outbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY id LIMIT 1")
   const markSent = db.prepare("UPDATE sheet_outbox SET status = 'sent', attempts = attempts + 1, sent_at = ?, response = ?, last_error = NULL WHERE id = ?")
   const markRetry = db.prepare('UPDATE sheet_outbox SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, response = ? WHERE id = ?')
   const markFailed = db.prepare("UPDATE sheet_outbox SET status = 'failed', attempts = attempts + 1, last_error = ?, response = ? WHERE id = ?")
@@ -94,6 +97,7 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
       cursor = rows.at(-1).seq
     }
     setCursor.run(String(cursor))
+    if (added) log.info({ queued: added }, 'sheets: queued logged messages for forwarding')
     return { added, noRace: [...noRace] }
   })
 
@@ -120,14 +124,28 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
     return added
   })
   backfillActive()
+  log.info({ targets: targets.map(t => ({ key: t.key, groupJid: t.groupJid, groupName: t.groupName, url: maskUrl(t.url) })) }, targets.length ? 'sheets: forwarding enabled' : 'sheets: forwarding disabled (no targets)')
 
   const warnedNoRace = new Set()
   let pumping = false
   let pumpAgain = false
+  let lastSentAt = 0
 
+  /**
+   * One POST to the Apps Script endpoint. Every call is logged ("sheets: POST" → "sheets: response" /
+   * "sheets: request failed") with the exact payload, the HTTP status, the redirect target host, the time
+   * taken and the script's own answer, so "it is not arriving" can be answered from the log alone.
+   */
   const sendOne = async row => {
     const target = byKey.get(row.target)
-    if (!target) return markFailed.run(`No target "${row.target}" in config/sheets.json`, null, row.id)
+    if (!target) {
+      log.error({ outbox: row.id, target: row.target }, 'sheets: no such target in config/sheets.json; marking failed')
+      return markFailed.run(`No target "${row.target}" in config/sheets.json`, null, row.id)
+    }
+    const payload = JSON.parse(row.payload_json)
+    const ctx = { outbox: row.id, target: row.target, session: row.session_id, row: row.row_id, attempt: row.attempts + 1, of: MAX_ATTEMPTS }
+    log.info({ ...ctx, url: maskUrl(target.url), payload }, 'sheets: POST')
+    const t0 = Date.now()
     let text = ''
     try {
       const res = await fetchImpl(target.url, {
@@ -138,37 +156,56 @@ export const createSheetsForwarder = ({ db, targets, ops, log, fetchImpl = globa
         signal: AbortSignal.timeout(TIMEOUT_MS)
       })
       text = (await res.text()).slice(0, 2000)
+      const ms = Date.now() - t0
       let body = null
       try { body = JSON.parse(text) } catch { /* not JSON (e.g. an HTML error page) */ }
-      if (res.ok && body?.status === 'success') return markSent.run(now(), text, row.id)
-      const reason = body?.message || `HTTP ${res.status}${body ? '' : ' (response was not JSON)'}`
+      let host = null
+      try { host = res.url ? new URL(res.url).host : null } catch { /* mock responses have no url */ }
+      const seen = { ...ctx, httpStatus: res.status, redirected: Boolean(res.redirected), host, ms, response: text.slice(0, 300) }
+
+      if (res.ok && body?.status === 'success') {
+        log.info({ ...seen, result: 'sent' }, 'sheets: response')
+        return markSent.run(now(), text, row.id)
+      }
+      let reason = body?.message || `HTTP ${res.status}${body ? '' : ' (response was not JSON)'}`
       // the script rejecting our group name is a configuration problem: retrying cannot fix it
       if (/unrecognized group name/i.test(reason)) {
+        log.error({ ...seen, result: 'failed (group name rejected)' }, 'sheets: response')
         markFailed.run(reason, text, row.id)
-        return ops.emit({ level: 'error', code: 'sheets.config', message: `Google Sheets rejected group "${JSON.parse(row.payload_json).groupName}": ${reason}. Fix the Apps Script group mapping, then retry failed rows in Settings → Logs → Google Sheets.`, context: { target: row.target } })
+        return ops.emit({ level: 'error', code: 'sheets.config', message: `Google Sheets rejected group "${payload.groupName}": ${reason}. Fix the Apps Script group mapping, then retry failed rows in Settings → Logs → Google Sheets.`, context: { target: row.target } })
       }
-      throw new Error(reason)
+      // "Template Sheet not found!" is what the script says when the RACE <n> sheet does not exist
+      if (/template sheet not found/i.test(reason)) reason = `The spreadsheet has no "RACE ${payload.raceNumber}" sheet (script said: ${reason})`
+      log.warn({ ...seen, result: 'rejected' }, 'sheets: response')
+      throw Object.assign(new Error(reason), { logged: true })
     } catch (err) {
       const reason = err.name === 'TimeoutError' ? `timed out after ${TIMEOUT_MS / 1000} s` : err.message
+      if (!err.logged) log.warn({ ...ctx, ms: Date.now() - t0, error: err.name, reason, cause: err.cause?.code || err.cause?.message }, 'sheets: request failed')
       if (row.attempts + 1 >= MAX_ATTEMPTS) {
         markFailed.run(reason, text || null, row.id)
+        log.error({ ...ctx, reason }, 'sheets: giving up on this message')
         ops.emit({ level: 'error', code: 'sheets.failed', message: `A message could not be sent to Google Sheets after ${MAX_ATTEMPTS} attempts (${reason}). Retry it from Settings → Logs → Google Sheets.`, context: { target: row.target, outbox: row.id, session: row.session_id, row: row.row_id } })
       } else {
-        markRetry.run(now() + backoffMs(row.attempts + 1), reason, text || null, row.id)
+        const retryIn = backoffMs(row.attempts + 1)
+        markRetry.run(now() + retryIn, reason, text || null, row.id)
+        log.info({ ...ctx, retryInSeconds: Math.round(retryIn / 1000) }, 'sheets: will retry')
         if (row.attempts + 1 >= 3) ops.emit({ level: 'warn', code: 'sheets.retrying', message: `Google Sheets is not accepting messages (${reason}); retrying automatically`, context: { target: row.target } })
       }
     }
   }
 
-  /** Send everything that is due, CONCURRENCY at a time. Single-flight. */
+  /** Send due messages one at a time, oldest first, never faster than one every SEND_INTERVAL_MS. Single-flight. */
   const pump = async () => {
     if (pumping) { pumpAgain = true; return }
     pumping = true
     try {
       do {
         pumpAgain = false
-        for (let batch; (batch = due.all(now(), CONCURRENCY * 5)).length;) {
-          for (let i = 0; i < batch.length; i += CONCURRENCY) await Promise.all(batch.slice(i, i + CONCURRENCY).map(sendOne))
+        for (let row; (row = nextDue.get(now()));) {
+          const wait = lastSentAt + sendIntervalMs - now()
+          if (wait > 0) await sleep(wait)
+          lastSentAt = now()
+          await sendOne(row)
         }
       } while (pumpAgain)
     } catch (err) {

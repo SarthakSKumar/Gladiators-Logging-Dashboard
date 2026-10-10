@@ -21,8 +21,6 @@ const boot = async () => {
   const root = tmpDir();
   const configDir = join(root, "config");
   mkdirSync(configDir);
-  // legacy config: imported once, resolved by exact label on the first group refresh
-  writeFileSync(join(configDir, "groups.json"), JSON.stringify([{ key: "indian", label: "Gladiators Indian Racing 🏇🏻" }]));
   writeFileSync(join(configDir, "admins.json"), JSON.stringify([{ name: "Sarthak", email: ADMIN, phone: "+91 97429 13699" }]));
   process.env.CONFIG_DIR = configDir; // loadAdmins reads config.configDir lazily
   const { config } = await import("../src/config.js");
@@ -105,12 +103,12 @@ test("end to end: login, link on demand, auto capture, groups from the account, 
     assert.equal(st.linked, true);
     assert.equal(st.me.number, "+91 98••••3210");
     assert.equal(st.capture.state, "idle", "linked, no group logging");
-    assert.equal(st.groups.length, 1);
-    assert.equal(st.groups[0].jid, G1, "legacy groups.json row resolved by exact label");
+    assert.equal(st.groups.length, 0, "nothing is selected until the user picks groups from the account list");
 
     // ---- group selection ----
     const accountGroups = (await get("/api/wa/groups")).groups;
-    assert.deepEqual(accountGroups.map((g) => g.selected), [true, false]);
+    assert.deepEqual(accountGroups.map((g) => g.selected), [false, false]);
+    assert.equal((await post("/api/groups", { jid: G1 })).status, 200);
     assert.equal((await post("/api/groups", { jid: G2 })).status, 200);
     assert.equal((await post("/api/groups", { jid: "nope@g.us" })).status, 404);
     st = await get("/api/status");
