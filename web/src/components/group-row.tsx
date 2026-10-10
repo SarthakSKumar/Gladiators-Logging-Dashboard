@@ -1,4 +1,4 @@
-import { List, Loader2, Play, Square } from "lucide-react"
+import { FileSpreadsheet, List, Loader2, Play, Square } from "lucide-react"
 import { useEffect, useState } from "react"
 import { Dot, StatusPill, type Tone } from "@/components/status"
 import { StartLoggingDialog } from "@/components/start-logging-dialog"
@@ -68,6 +68,16 @@ export function GroupRow({ group, capture, onHistory }: { group: SelectedGroup; 
         <span className="min-w-0 truncate font-medium sm:max-w-[45%] sm:shrink-0" title={group.label}>
           {group.label}
         </span>
+        {group.sheets && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span tabIndex={0} aria-label="Sent to Google Sheets" className="hidden shrink-0 rounded text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring/50 sm:inline-flex">
+                <FileSpreadsheet className="size-3.5" />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>Messages are sent to Google Sheets ({group.sheets.groupName}) on the RACE sheet of the session’s race number</TooltipContent>
+          </Tooltip>
+        )}
         <Separator orientation="vertical" className="hidden data-[orientation=vertical]:h-4 sm:block" />
         <span className="min-w-0 truncate text-sm text-muted-foreground tabular-nums">
           {s ? (

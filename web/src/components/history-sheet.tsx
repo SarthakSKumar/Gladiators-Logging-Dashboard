@@ -31,7 +31,26 @@ function SessionSummary({ s }: { s: Session }) {
   )
 }
 
-function MessagesTable({ sessionId, running }: { sessionId: number; running: boolean }) {
+const SHEET: Record<string, { label: string; className: string }> = {
+  sent: { label: "Sent", className: "text-success-ink" },
+  pending: { label: "Sending…", className: "text-warning-ink" },
+  failed: { label: "Failed", className: "text-danger" },
+  skipped: { label: "Not sent", className: "text-muted-foreground" },
+}
+
+function SheetCell({ m }: { m: MessageRow }) {
+  const s = m.sheet_status ? SHEET[m.sheet_status] : null
+  if (!s) return <span className="text-muted-foreground">—</span>
+  const tip = m.sheet_status === "sent" ? `Written to row ${m.sheet_row! + 2} (S.No ${m.sheet_row})` : m.sheet_error || s.label
+  return (
+    <span className={s.className} title={tip}>
+      {s.label}
+      {m.sheet_status === "sent" && <span className="text-muted-foreground tabular-nums"> · #{m.sheet_row}</span>}
+    </span>
+  )
+}
+
+function MessagesTable({ sessionId, running, sheets }: { sessionId: number; running: boolean; sheets: boolean }) {
   const q = useMessages(sessionId)
   if (q.isPending)
     return (
@@ -61,6 +80,7 @@ function MessagesTable({ sessionId, running }: { sessionId: number; running: boo
             <TableHead className="w-20">Time</TableHead>
             <TableHead className="w-36">Sender</TableHead>
             <TableHead>Message</TableHead>
+            {sheets && <TableHead className="w-28">Sheet</TableHead>}
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -74,10 +94,14 @@ function MessagesTable({ sessionId, running }: { sessionId: number; running: boo
                 {senderOf(m)}
               </TableCell>
               <TableCell className="whitespace-pre-wrap break-words">
-                {m.quoted_body && <span className="mb-1 block truncate border-l-2 pl-2 text-xs text-muted-foreground">{m.quoted_body}</span>}
+                {m.quoted_body && <span className="mb-1 block truncate rounded bg-surface-2 px-1.5 py-0.5 text-xs text-muted-foreground">{m.quoted_body}</span>}
                 {m.body}
-                {m.source === "offline" && <span className="ml-2 text-xs text-muted-foreground">· delivered after reconnect</span>}
               </TableCell>
+              {sheets && (
+                <TableCell className="text-xs whitespace-nowrap">
+                  <SheetCell m={m} />
+                </TableCell>
+              )}
             </TableRow>
           ))}
         </TableBody>
@@ -150,7 +174,7 @@ export function HistorySheet({ group, open, onOpenChange }: { group: SelectedGro
                 </SelectContent>
               </Select>
               {current && <SessionSummary s={current} />}
-              {current && <MessagesTable sessionId={current.id} running={!current.ended_at} />}
+              {current && <MessagesTable sessionId={current.id} running={!current.ended_at} sheets={Boolean(group?.sheets)} />}
             </>
           )}
         </div>

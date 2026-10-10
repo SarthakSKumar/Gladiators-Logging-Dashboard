@@ -42,7 +42,7 @@ export const elapsed = (from: number, to = Date.now()) => {
 }
 
 export const sessionName = (s: { label: string; race_number: number | null }) =>
-  s.race_number && !new RegExp(`\\b${s.race_number}\\b`).test(s.label) ? `${s.label} · Race ${s.race_number}` : s.label
+  s.race_number && !new RegExp(`\\b${s.race_number}\\b`).test(s.label) ? `${s.label} · RACE ${s.race_number}` : s.label
 
 export const greeting = (now = Date.now()) => {
   const h = Number(fmt({ hour: "2-digit", hour12: false }).format(now))

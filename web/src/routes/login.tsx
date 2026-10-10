@@ -8,9 +8,19 @@ import { InputOTP, InputOTPGroup, InputOTPSlot } from "@/components/ui/input-otp
 import { Label } from "@/components/ui/label"
 import { post } from "@/lib/api"
 
+// The form survives switching to the mail app and back (or a reload) within this tab.
+const saved = (k: string) => {
+  try { return sessionStorage.getItem(`login.${k}`) ?? "" } catch { return "" }
+}
+const save = (k: string, v: string) => {
+  try { if (v) sessionStorage.setItem(`login.${k}`, v); else sessionStorage.removeItem(`login.${k}`) } catch { /* private mode */ }
+}
+
 export function LoginPage() {
-  const [step, setStep] = useState<"email" | "code">("email")
-  const [email, setEmail] = useState("")
+  const [step, setStepState] = useState<"email" | "code">(saved("step") === "code" && saved("email") ? "code" : "email")
+  const [email, setEmailState] = useState(saved("email"))
+  const setStep = (s: "email" | "code") => { save("step", s); setStepState(s) }
+  const setEmail = (e: string) => { save("email", e); setEmailState(e) }
   const [code, setCode] = useState("")
   const [cooldown, setCooldown] = useState(0)
 
@@ -32,7 +42,11 @@ export function LoginPage() {
   const verify = useMutation({
     mutationFn: (c: string) => post("/api/auth/verify-otp", { email: email.trim(), code: c }),
     meta: { silent: true },
-    onSuccess: () => window.location.replace("/"),
+    onSuccess: () => {
+      save("step", "")
+      save("email", "")
+      window.location.replace("/")
+    },
     onError: () => setCode(""),
   })
   const error = (step === "email" ? send.error : verify.error ?? send.error)?.message

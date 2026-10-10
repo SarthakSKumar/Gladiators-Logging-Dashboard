@@ -4,16 +4,20 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { bytes, elapsed, full, num, timeOfDay, when } from "@/lib/format"
-import { useDiagnostics, useEvents } from "@/lib/queries"
+import { notifySuccess } from "@/lib/notify"
+import { useDiagnostics, useEvents, useRetrySheets, useSheets } from "@/lib/queries"
+import { Button } from "@/components/ui/button"
+import { RotateCw } from "lucide-react"
 import type { Diagnostics, OpEvent } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
-type LogType = "health" | "counters" | "gaps" | "connection"
+type LogType = "health" | "counters" | "gaps" | "connection" | "sheets"
 const TYPES: { value: LogType; label: string }[] = [
   { value: "health", label: "Ingestion health" },
   { value: "counters", label: "Counters" },
   { value: "gaps", label: "Capture gaps" },
   { value: "connection", label: "Connection log" },
+  { value: "sheets", label: "Google Sheets" },
 ]
 
 function KV({ rows }: { rows: [string, React.ReactNode, string?][] }) {
@@ -60,6 +64,7 @@ const COUNTER_HELP: Record<string, string> = {
   excluded_non_group: "Not a group chat (ignored)",
   excluded_non_target_group: "Group not selected (ignored)",
   excluded_type: "Not plain text — media, stickers, reactions… (ignored by design)",
+  excluded_out_of_session: "Sent outside a logging session (not stored by design)",
   undecryptable: "Couldn’t be decrypted (reported in the connection log)",
   journaled: "Saved durably to the journal",
   inflight: "Received, not yet durable",
@@ -209,6 +214,84 @@ function ConnectionLog({ d, events }: { d: Diagnostics; events: OpEvent[] }) {
   )
 }
 
+function SheetsLog() {
+  const q = useSheets()
+  const retry = useRetrySheets()
+  if (q.isPending) return <Skeleton className="h-60 w-full rounded-xl" />
+  if (q.isError) return <p className="rounded-xl border bg-background px-4 py-6 text-sm text-danger">Couldn’t load Google Sheets status: {q.error.message}</p>
+  if (!q.data.enabled)
+    return <p className="rounded-xl border bg-background px-4 py-10 text-center text-sm text-muted-foreground">Google Sheets forwarding is not configured (config/sheets.json).</p>
+  const anyFailed = q.data.targets.some((t) => t.failed)
+  return (
+    <div className="grid gap-4">
+      <div className="overflow-hidden rounded-xl border bg-background">
+        <Table>
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead>Sheet group</TableHead>
+              <TableHead className="text-right">Sent</TableHead>
+              <TableHead className="text-right">Sending</TableHead>
+              <TableHead className="text-right">Failed</TableHead>
+              <TableHead className="text-right">Not sent</TableHead>
+              <TableHead>Last sent</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {q.data.targets.map((t) => (
+              <TableRow key={t.key}>
+                <TableCell>
+                  <span className="font-medium">{t.groupName}</span>
+                  <span className="block font-mono text-xs text-muted-foreground">{t.endpoint}</span>
+                  {t.lastError && <span className="block text-xs text-danger">{t.lastError}</span>}
+                </TableCell>
+                <TableCell className="text-right tabular-nums">{num(t.sent)}</TableCell>
+                <TableCell className={cn("text-right tabular-nums", t.pending && "text-warning-ink")}>{num(t.pending)}</TableCell>
+                <TableCell className={cn("text-right tabular-nums", t.failed && "font-semibold text-danger")}>{num(t.failed)}</TableCell>
+                <TableCell className="text-right tabular-nums text-muted-foreground" title="Sessions without a race number are not sent">{num(t.skipped)}</TableCell>
+                <TableCell className="tabular-nums">{t.lastSentAt ? when(t.lastSentAt) : "—"}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <Button variant="outline" size="sm" disabled={!anyFailed || retry.isPending} onClick={() => retry.mutate(undefined, { onSuccess: (r) => notifySuccess(`Retrying ${r.requeued} message${r.requeued === 1 ? "" : "s"}`) })}>
+          <RotateCw /> Retry failed
+        </Button>
+        <span className="text-xs text-muted-foreground">Each message keeps its row number, so a retry rewrites the same row instead of adding a duplicate.</span>
+      </div>
+      {q.data.failures.length > 0 && (
+        <div className="overflow-hidden rounded-xl border bg-background">
+          <Table>
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead>Time</TableHead>
+                <TableHead>Message</TableHead>
+                <TableHead className="text-right">S.No</TableHead>
+                <TableHead className="text-right">Attempts</TableHead>
+                <TableHead>Problem</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {q.data.failures.map((f) => (
+                <TableRow key={f.id}>
+                  <TableCell className="tabular-nums">{when(f.wa_timestamp)}</TableCell>
+                  <TableCell className="max-w-56 truncate">{f.body}</TableCell>
+                  <TableCell className="text-right tabular-nums">{f.row_id}</TableCell>
+                  <TableCell className="text-right tabular-nums">{f.attempts}</TableCell>
+                  <TableCell className="max-w-72 truncate text-danger" title={f.last_error}>
+                    {f.last_error}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function LogsSettings() {
   const [type, setType] = useState<LogType>("health")
   const d = useDiagnostics()
@@ -228,9 +311,11 @@ export function LogsSettings() {
             ))}
           </SelectContent>
         </Select>
-        <span className="text-xs text-muted-foreground">{type === "connection" ? "Live — new events appear automatically" : "Refreshes every 10 s"}</span>
+        <span className="text-xs text-muted-foreground">{type === "connection" ? "Live — new events appear automatically" : type === "sheets" ? "Refreshes every 5 s" : "Refreshes every 10 s"}</span>
       </div>
-      {d.isPending ? (
+      {type === "sheets" ? (
+        <SheetsLog />
+      ) : d.isPending ? (
         <Skeleton className="h-80 w-full rounded-xl" />
       ) : d.isError ? (
         <p className="rounded-xl border bg-background px-4 py-6 text-sm text-danger">Couldn’t load logs: {d.error.message}</p>

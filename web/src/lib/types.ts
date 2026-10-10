@@ -50,6 +50,8 @@ export interface SelectedGroup {
   lastMessageAt: number | null
   session: Session | null
   count: number
+  /** custom integration: messages of this group are forwarded to Google Sheets */
+  sheets: { groupName: string } | null
 }
 
 export interface Status {
@@ -99,6 +101,27 @@ export interface MessageRow {
   skew_flag: number
   contact_name: string | null
   member_tag: string | null
+  sheet_status: "pending" | "sent" | "failed" | "skipped" | null
+  sheet_row: number | null
+  sheet_error: string | null
+}
+
+export interface SheetsTarget {
+  key: string
+  groupJid: string
+  groupName: string
+  endpoint: string
+  pending: number
+  sent: number
+  failed: number
+  skipped: number
+  lastSentAt: number | null
+  lastError: string | null
+}
+export interface SheetsStatus {
+  enabled: boolean
+  targets: SheetsTarget[]
+  failures: { id: number; target: string; session_id: number; row_id: number; attempts: number; last_error: string; created_at: number; body: string; wa_timestamp: number }[]
 }
 
 export interface MessagesPage {

@@ -31,7 +31,7 @@ const PHASE: Record<string, string> = {
   connecting: "Connecting",
   qr: "Waiting for QR scan",
   pairing: "Pairing",
-  syncing: "Syncing offline messages",
+  syncing: "Starting",
   online: "Connected",
   reconnecting: "Reconnecting",
   closing: "Closing safely",
@@ -68,7 +68,7 @@ export function WhatsAppSettings() {
           </Row>
           <Row label="Groups logging">
             <span className="tabular-nums">{c.logging}</span>
-            <span className="text-muted-foreground"> · capture starts automatically while any group is logging</span>
+            <span className="text-muted-foreground"> · only messages sent while a group is logging are stored</span>
           </Row>
         </dl>
       </section>

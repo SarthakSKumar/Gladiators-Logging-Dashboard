@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { api, del, post } from "./api"
-import type { AccountGroup, Diagnostics, Kpis, Me, MessagesPage, OpEvent, Session, Status } from "./types"
+import type { AccountGroup, Diagnostics, Kpis, Me, MessagesPage, OpEvent, Session, SheetsStatus, Status } from "./types"
 
 export const keys = {
   me: ["me"] as const,
@@ -11,9 +11,11 @@ export const keys = {
   accountGroups: ["account-groups"] as const,
   events: ["events"] as const,
   diagnostics: ["diagnostics"] as const,
+  sheets: ["sheets"] as const,
 }
 
-export const useMe = () => useQuery({ queryKey: keys.me, queryFn: () => api<Me>("/api/auth/me"), retry: false, staleTime: 60_000 })
+export const useMe = () =>
+  useQuery({ queryKey: keys.me, queryFn: () => api<Me>("/api/auth/me"), retry: false, staleTime: 60_000, refetchOnWindowFocus: false })
 // status is pushed over SSE; the query is the initial load + a slow safety refresh
 export const useStatus = () => useQuery({ queryKey: keys.status, queryFn: () => api<Status>("/api/status"), refetchInterval: 30_000 })
 export const useKpis = () => useQuery({ queryKey: keys.kpis, queryFn: () => api<Kpis>("/api/kpis"), refetchInterval: 60_000 })
@@ -78,6 +80,12 @@ export const useRestartConnection = () => {
 export const useUnlink = () => {
   const inv = useInvalidate()
   return useMutation({ mutationFn: () => post("/api/wa/unlink", { confirm: "UNLINK" }), onSuccess: () => inv(keys.status, keys.kpis) })
+}
+export const useSheets = (enabled = true) =>
+  useQuery({ queryKey: keys.sheets, queryFn: () => api<SheetsStatus>("/api/integrations/sheets"), enabled, refetchInterval: 5_000 })
+export const useRetrySheets = () => {
+  const inv = useInvalidate()
+  return useMutation({ mutationFn: (target?: string) => post<{ requeued: number }>("/api/integrations/sheets/retry", { target }), onSuccess: () => inv(keys.sheets) })
 }
 export const useSignOut = () =>
   useMutation({

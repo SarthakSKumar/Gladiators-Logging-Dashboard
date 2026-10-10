@@ -58,7 +58,8 @@ function RequireLinked() {
 
 function PublicOnly() {
   const me = useMe()
-  if (me.isPending) return <Loading />
+  // only the very first check shows a loader: a later background re-check must not unmount the login form
+  if (!me.isFetched) return <Loading />
   if (me.isSuccess) return <Navigate to="/" replace />
   return <Outlet />
 }
