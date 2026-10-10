@@ -13,6 +13,7 @@ const sandbox = ({ props = {}, sheets = ["RACE 1", "RACE 2", "RACE 3"], fetch = 
   const writes = []; // { sheet, row, values }
   const cells = {}; // `${sheet}!${row}` -> { background, note }
   const debug = [];
+  const logs = [];
   const fetches = [];
   const range = (sheet, row) => ({
     setValues: (v) => writes.push({ sheet, row, values: plain(v) }),
@@ -20,7 +21,7 @@ const sandbox = ({ props = {}, sheets = ["RACE 1", "RACE 2", "RACE 3"], fetch = 
     setNote: (n) => { (cells[`${sheet}!${row}`] ??= {}).note = n; },
   });
   const ctx = vm.createContext({
-    Logger: { log() {} },
+    Logger: { log: (m) => logs.push(String(m)) },
     ContentService: { createTextOutput: (s) => ({ s, setMimeType() { return this; } }), MimeType: { JSON: "json" } },
     Utilities: {
       formatDate: (d, tz, fmt) => {
@@ -49,9 +50,9 @@ const sandbox = ({ props = {}, sheets = ["RACE 1", "RACE 2", "RACE 3"], fetch = 
       }),
     },
   });
-  const api = vm.runInContext(`${SOURCE}\n;({ parseBetByRules, betObjectFromAiReply, aiBetAgreesWithMessage, parseBetWithAI, doPost, doGet, asText })`, ctx);
+  const api = vm.runInContext(`${SOURCE}\n;({ parseBetByRules, betObjectFromAiReply, aiBetAgreesWithMessage, parseBetWithAI, doPost, doGet, asText, authorize })`, ctx);
   const post = (body) => plain(JSON.parse(api.doPost({ postData: { contents: JSON.stringify(body) } }).s));
-  return { api, post, writes, cells, debug, fetches };
+  return { api, post, writes, cells, debug, fetches, logs };
 };
 
 const rules = (m) => plain(sandbox().api.parseBetByRules(m));
@@ -235,4 +236,17 @@ test("doPost: sender/message that look like formulas are stored as text (no spre
   assert.equal(v[2], `'=HYPERLINK("http://evil","x")`);
   assert.equal(v[3], "'+1w100");
   assert.equal(v[4], "=LEFT(C3, 2)", "the script's own formula is untouched");
+});
+
+test("authorize(): read-only permission check — touches all three spreadsheets, reports missing RACE sheets, writes nothing", () => {
+  const t = sandbox({ sheets: ["RACE 1", "RACE 2", "RACE 3"] });
+  t.api.authorize();
+  assert.equal(t.writes.length, 0);
+  assert.equal(t.fetches.length, 0);
+  assert.match(t.logs.join("\n"), /Indian spreadsheet: OK — MISSING sheets: RACE 4, RACE 5, RACE 6, RACE 7, RACE 8, RACE 9, RACE 10/);
+  assert.match(t.logs.join("\n"), /International spreadsheet: OK/);
+  assert.match(t.logs.join("\n"), /Debug spreadsheet: OK/);
+  const full = sandbox({ sheets: Array.from({ length: 10 }, (_, i) => `RACE ${i + 1}`) });
+  full.api.authorize();
+  assert.match(full.logs.join("\n"), /RACE 1\.\.10 all present/);
 });

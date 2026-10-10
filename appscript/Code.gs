@@ -489,6 +489,26 @@ function doPost(e) {
 // Run these from the editor (Run ▶) after deploying — they do not touch any spreadsheet
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * RUN THIS ONCE from the editor after pasting any new version (select "authorize" → Run ▶ → Review permissions
+ * → Allow). A web app cannot ask for permissions itself: until the owner has granted them, every request fails
+ * with "You do not have permission to call SpreadsheetApp.openById". Read-only — it changes nothing; it also
+ * reports which RACE sheets are missing. (Do NOT use resetSheets() for this: that one deletes sheets.)
+ */
+function authorize() {
+  [["Indian", indianRacingSpreadsheet], ["International", internationalRacingSpreadsheet]].forEach(function (entry) {
+    const ss = SpreadsheetApp.openById(entry[1]);
+    const missing = [];
+    for (let n = 1; n <= 10; n++) {
+      if (!ss.getSheetByName("RACE " + n)) missing.push("RACE " + n);
+    }
+    Logger.log(entry[0] + " spreadsheet: OK — " + (missing.length ? "MISSING sheets: " + missing.join(", ") : "RACE 1..10 all present"));
+  });
+  const debugSheet = SpreadsheetApp.openById(debugSpreadsheet).getSheetByName("Debug");
+  Logger.log("Debug spreadsheet: " + (debugSheet ? "OK" : "MISSING a sheet named Debug"));
+  Logger.log("Permissions granted. Now: Deploy → Manage deployments → Edit (pencil) → Version: New version → Deploy.");
+}
+
 /** Shows whether the optional AI fallback is configured and whether Cloudflare accepts the token. */
 function checkSetup() {
   const props = PropertiesService.getScriptProperties();
